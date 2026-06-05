@@ -1,6 +1,6 @@
 # Agentopia
 
-[English](README.md) | **简体中文** | [日本語](README.ja.md) | [한국어](README.ko.md)
+[English](../README.md) | **简体中文** | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 **Agentopia** 是一个用于多智能体社会长期生活模拟的框架。Agentopia 以年为尺度模拟人类社会生活：在我们的实验中，100 个智能体在 10 个模拟年份里自主参与社会生活。
 它们设定并追求自己的目标，发展并满足自身的需求，并与其他智能体互动，在社会中建立关系。
