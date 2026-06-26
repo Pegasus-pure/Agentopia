@@ -4,8 +4,7 @@ This fork contains several extensions built on top of [Agentopia](https://github
 
 > [!NOTE]
 > For the original project description, documentation, and setup instructions, please see:
-> - [English](docs/README_en.md)
-> - [简体中文](docs/README_zh.md) | [日本語](docs/README_ja.md) | [한국어](docs/README_ko.md)
+> - [English](docs/README_en.md) | [简体中文](docs/README_zh.md) | [日本語](docs/README_ja.md) | [한국어](docs/README_ko.md)
 
 ---
 
