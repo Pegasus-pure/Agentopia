@@ -414,6 +414,30 @@ class MessageCenter:
         self._notifications.clear()
         self._person2activity.clear()
 
+    def _ensure_activity_phase(self, at: TimeState) -> TimeState:
+        """Ensure activity_time carries a phase for multi-phase day support.
+
+        When a schedule's activity_time has no phase (e.g., joint activities
+        proposed at day granularity during CONTACT), assign the first configured
+        day phase as default.  For n_phases=1 this is a no-op in terms of
+        runtime behaviour (wildcard matching in get_schedule_for_day_phase
+        handles it).
+
+        Args:
+            at: Parsed activity_time from a proposal.
+
+        Returns:
+            TimeState with phase filled in (same object if phase already set).
+        """
+        if at.stage == Stage.ACTIVITY and at.phase is None:
+            phases = self.clock.get_phases()
+            if phases:
+                return TimeState(
+                    year=at.year, week=at.week, stage=at.stage,
+                    day=at.day, slot=at.slot, phase=phases[0],
+                )
+        return at
+
     def confirm_schedule(
         self,
         existing_schedules: Optional[Dict[str, Dict[str, "Schedule"]]] = None,
@@ -772,7 +796,7 @@ class MessageCenter:
                 sched = Schedule(
                     activity_id=p.id,
                     activity_name=p.activity_name,
-                    activity_time=TimeState.from_string(p.activity_time),
+                    activity_time=self._ensure_activity_phase(TimeState.from_string(p.activity_time)),
                     proposer=p.proposer,
                     participants=[],
                     actions={},
@@ -829,7 +853,7 @@ class MessageCenter:
                 sched = Schedule(
                     activity_id=p.id,
                     activity_name=p.activity_name,
-                    activity_time=TimeState.from_string(p.activity_time),
+                    activity_time=self._ensure_activity_phase(TimeState.from_string(p.activity_time)),
                     proposer=p.proposer,
                     participants=participants,
                     actions=actions_map,
@@ -859,7 +883,7 @@ class MessageCenter:
                 sched = Schedule(
                     activity_id=p.id,
                     activity_name=p.activity_name,
-                    activity_time=TimeState.from_string(p.activity_time),
+                    activity_time=self._ensure_activity_phase(TimeState.from_string(p.activity_time)),
                     proposer=p.proposer,
                     participants=participants,
                     actions={},

@@ -55,6 +55,14 @@ def main() -> None:
         help="Maximum number of agents to bootstrap from data (default: no limit)",
     )
     parser.add_argument(
+        "--player",
+        dest="player",
+        type=str,
+        choices=["on", "off"],
+        default=None,
+        help="Player mode: 'on' or 'off' (overrides config.enable_player)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging for world/utils/agents",
@@ -243,11 +251,20 @@ def main() -> None:
     # Determine resume_from: CLI override or auto-detect from checkpoint
     resume_from = resume_from_parsed if (args.run_id or args.resume) else None
 
+    # Resolve player mode: CLI --player on/off > config.enable_player
+    if args.player == "on":
+        player_enabled = True
+    elif args.player == "off":
+        player_enabled = False
+    else:
+        player_enabled = None  # use config default
+
     w = World(
         no_context_engineering=args.no_ce,
         parallel=args.parallel,
         no_history=args.no_history,
         max_agents=args.max_agents,
+        player_enabled=player_enabled,
         resume_from=resume_from,
     )
 

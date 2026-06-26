@@ -1,14 +1,15 @@
-# LLM backends
-openai>=1.0.0
-anthropic>=0.40.0
-google-genai>=0.3.0
-google-auth>=2.0.0
-
-# Tokenization
-tiktoken>=0.5.0
-
-# HTTP / IO utilities
+# --- 核心依赖 ---
+openai>=1.0.0              # DeepSeek 通过 OpenAI 兼容接口，必须
 requests>=2.28.0
 jsonlines>=3.0.0
 file-read-backwards>=3.0.0
 python-dotenv>=1.0.0
+
+# --- Token 计数（可选，失败自动 fallback 到字符估算）---
+tiktoken>=0.5.0
+
+# --- 以下为其他 LLM Provider（国内需代理，当前未使用）---
+# 如需启用，取消注释并 pip install
+# anthropic>=0.40.0         # Claude API
+# google-genai>=0.3.0       # Gemini API
+# google-auth>=2.0.0        # Gemini 认证

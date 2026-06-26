@@ -6,14 +6,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor
 
-from src.world.clock import Clock, Stage, TimeState
+from src.world.clock import Clock, DayPhase, Stage, TimeState
 from src.agents.role_agent import RoleAgent
+from src.agents.player_agent import PlayerAgent
 from src.world.scheduling import MessageCenter, Schedule, PublicEvent
 from src.world.cleanup import clean_append_only_jsonl_before
 from src.world.god import init_god_module
 from src.utils import get_logger, pool_size, set_log_run_id
 from src.config import get_world_config, get_config
 from src.world.activity import JointActivity, SoloActivity
+from src.world.state import WorldState
+from src.world.action import Action
 
 
 class World:
@@ -28,8 +31,12 @@ class World:
         no_history: bool = False,
         max_agents: int | None = None,
         resume_from: Optional[Tuple[int, int]] = None,
+        player_enabled: Optional[bool] = None,
     ) -> None:
         self.config = get_world_config()
+        # CLI override for player mode
+        if player_enabled is not None:
+            self.config["enable_player"] = player_enabled
         self.clock = Clock(start_year=self.config["time"]["start_year"], start_week=0)
 
         # data_dir: file path (includes run_id); name: logical identifier (used for prompts)
@@ -79,6 +86,11 @@ class World:
         # Message center: single instance shared by world and all agents
         self.msg_center = MessageCenter(world_name=self.data_dir, clock=self.clock)
 
+        # WorldState: per-phase position & action tracking (initialised later
+        # when day-loop begins; import deferred to avoid circular reference).
+        # TODO: from src.world.state import WorldState
+        self.world_state = None  # type: Optional[WorldState]
+
         # Bootstrap agents from existing dataset directories to avoid inventing personas here.
         # Initialize agents from data directory with a configurable cap
         self.agents: List[RoleAgent] = self._init_agents_from_data(
@@ -99,11 +111,18 @@ class World:
             raise FileNotFoundError(f"persona root not found: {root}")
         # Every persona should have a profile; for simplicity we no longer filter here. If one is missing, an error will be raised later at read time to surface the problem early.
         all_dirs = [p for p in sorted(root.iterdir()) if p.is_dir()]
+        # Exclude Player from the normal selection pool
+        persona_dirs = [d for d in all_dirs if d.name != "Player"]
         names = (
-            [p.name for p in all_dirs[:max_agents]]
+            [p.name for p in persona_dirs[:max_agents]]
             if max_agents
-            else [p.name for p in all_dirs]
+            else [p.name for p in persona_dirs]
         )
+        # Add Player only if enabled in config
+        player_enabled = self.config.get("enable_player", False)
+        player_dir = next((d for d in all_dirs if d.name == "Player"), None)
+        if player_dir and player_enabled:
+            names.append("Player")
 
         # Ensure locations file and private homes exist for current run world
         from src.world.locations import get_location_store
@@ -114,18 +133,28 @@ class World:
         model_assignment = self._load_or_assign_models(names)
 
         # Create agents first (needed for agents_summary in location generation)
-        agents = [
-            RoleAgent(
-                n,
-                clock=self.clock,
-                msg_center=self.msg_center,
-                model=model_assignment[n],
-                world_name=self.data_dir,
-                no_context_engineering=self.no_context_engineering,
-                no_history=self.no_history,
-            )
-            for n in names
-        ]
+        agents = []
+        for n in names:
+            if n == "Player":
+                agent = PlayerAgent(
+                    n,
+                    clock=self.clock,
+                    msg_center=self.msg_center,
+                    world_name=self.data_dir,
+                    no_context_engineering=self.no_context_engineering,
+                    no_history=self.no_history,
+                )
+            else:
+                agent = RoleAgent(
+                    n,
+                    clock=self.clock,
+                    msg_center=self.msg_center,
+                    model=model_assignment[n],
+                    world_name=self.data_dir,
+                    no_context_engineering=self.no_context_engineering,
+                    no_history=self.no_history,
+                )
+            agents.append(agent)
 
         # Build agents summary for location generation
         agents_summary = "\n\n".join(
@@ -173,8 +202,8 @@ class World:
             with path.open("r", encoding="utf-8") as f:
                 assignment = json.load(f)
             self.logger.info(f"Loaded model assignment from {path}")
-            # Validate all names are present
-            missing = [n for n in names if n not in assignment]
+            # Validate all names are present (Player doesn't need model, skip)
+            missing = [n for n in names if n not in assignment and n != "Player"]
             if missing:
                 raise ValueError(f"model_assignment.json missing agents: {missing}")
             # Warn if config models differ from persisted assignment
@@ -243,7 +272,7 @@ class World:
         tmp = p.with_suffix(".json.tmp")
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
-        tmp.rename(p)
+        tmp.replace(p)
 
     def _resolve_resume_point(
         self, resume_from: Optional[Tuple[int, int]]
@@ -669,11 +698,46 @@ class World:
         t = self.clock.get_time()
         self.logger.info(f"== PLAN STAGE == year={t.year} week={t.week}")
         if self.parallel:
-            with ThreadPoolExecutor(max_workers=pool_size(len(self.agents))) as ex:
-                list(ex.map(lambda a: a.plan(), self.agents))
+            # Player agent uses terminal input() — must run on main thread
+            npc_agents = [a for a in self.agents if a.name != "Player"]
+            player_agent = self._name2agent.get("Player")
+            if player_agent:
+                player_agent.plan()
+            if npc_agents:
+                with ThreadPoolExecutor(max_workers=pool_size(len(npc_agents))) as ex:
+                    list(ex.map(lambda a: a.plan(), npc_agents))
         else:
             for agent in self.agents:
                 agent.plan()
+
+        # After PLAN: generate explicit solo schedules for NPCs without any plan
+        t = self.clock.get_time()
+        n_days = self.config["time"]["n_day"]
+        # Determine the default phase for solo schedules (first configured phase)
+        day_phases = self.clock.get_phases()
+        default_phase = day_phases[0] if day_phases else None
+        for agent in self.agents:
+            if agent.name == "Player":
+                continue
+            busy_days = agent.dm.get_busy_days_this_week()
+            for day in range(1, n_days + 1):
+                if day not in busy_days:
+                    activity_time = TimeState(
+                        year=t.year,
+                        week=t.week,
+                        stage=Stage.ACTIVITY,
+                        day=day,
+                        phase=default_phase,
+                    )
+                    solo_schd = Schedule(
+                        activity_name="Solo",
+                        activity_time=activity_time,
+                        location=None,
+                        type="solo",
+                        status="created",
+                        participants=[agent.name],
+                    )
+                    agent.dm.add_schedule(solo_schd)
 
         # Stage 2: before_contact (God Model generates events → Agents respond)
         self.clock.set_stage(Stage.BEFORE_CONTACT)
@@ -682,6 +746,8 @@ class World:
 
         # God Model: generate public events for this week
         this_week_events = self._generate_public_events()
+        # Store for PlayerAgent contact() display (T03)
+        self.public_activities = this_week_events
 
         # Agents: sign up for public events (parallel)
         if this_week_events:
@@ -703,6 +769,69 @@ class World:
         self.clock.set_stage(Stage.CONTACT)
         # start of contact phase: clear per-week msg queue
         self.msg_center.clear()
+
+        # T02: Inject Player's pending invites into target NPCs' inbox
+        player_agent = self._name2agent.get("Player")
+        if player_agent is not None:
+            # T03: Pass public activities to PlayerAgent for display
+            if hasattr(player_agent, "set_public_activities"):
+                player_agent.set_public_activities(
+                    getattr(self, "public_activities", None)
+                )
+            # T02: Inject pending invites
+            if hasattr(player_agent, "_pending_invites"):
+                t_contact = self.clock.get_time()
+                for day, invite_info in list(player_agent._pending_invites.items()):
+                    target_name = invite_info.get("target", "")
+                    activity_name = invite_info.get("activity_name", "")
+                    location = invite_info.get("location", "")
+                    if not target_name:
+                        continue
+                    # Write invitation to target NPC's contact file
+                    invite_msg = (
+                        f"[邀请] {player_agent.name} 想约你在第{day}天"
+                        f"一起去{location or '某个地方'}: {activity_name}"
+                    )
+                    try:
+                        player_agent.dm.send_message(
+                            to=target_name, content=invite_msg
+                        )
+                    except Exception:
+                        self.logger.warning(
+                            f"[CONTACT] Failed to send invite to {target_name}",
+                            exc_info=True,
+                        )
+                    # Add to msg_center for confirm_schedule processing
+                    activity_time_str = str(
+                        TimeState(
+                            year=t_contact.year,
+                            week=t_contact.week,
+                            stage=Stage.ACTIVITY,
+                            day=day,
+                        )
+                    )
+                    self.msg_center.add(
+                        {
+                            "time": str(t_contact),
+                            "from": player_agent.name,
+                            "to": target_name,
+                            "type": "propose_joint_activity",
+                            "activity_name": activity_name,
+                            "activity_time": activity_time_str,
+                            "invited_persons": [target_name],
+                            "required_participants": [target_name, player_agent.name],
+                            "raw_action": invite_msg,
+                            "message": invite_msg,
+                            "location": location or "",
+                            "proposal": activity_name,
+                        }
+                    )
+                    self.logger.info(
+                        f"[CONTACT] Player invites {target_name} "
+                        f"for day {day}: {activity_name}"
+                    )
+                player_agent._pending_invites.clear()
+
         for slot in range(1, self.config["time"]["n_contact_slot"] + 1):
             self.clock.set_slot(slot)
             t = self.clock.get_time()
@@ -710,8 +839,16 @@ class World:
                 f"== CONTACT STAGE == year={t.year} week={t.week} slot={t.slot}"
             )
             if self.parallel:
-                with ThreadPoolExecutor(max_workers=pool_size(len(self.agents))) as ex:
-                    list(ex.map(lambda a: a.contact(), self.agents))
+                # Player agent uses terminal input() — must run on main thread
+                npc_agents = [a for a in self.agents if a.name != "Player"]
+                player_agent = self._name2agent.get("Player")
+                if player_agent:
+                    player_agent.contact()
+                if npc_agents:
+                    with ThreadPoolExecutor(
+                        max_workers=pool_size(len(npc_agents))
+                    ) as ex:
+                        list(ex.map(lambda a: a.contact(), npc_agents))
             else:
                 for agent in self.agents:
                     agent.contact()
@@ -735,112 +872,194 @@ class World:
             for agent in self.agents:
                 agent.finalize_contact()
 
-        # God Model: generate encounter events for idle agents
-        # (after finalize_contact so all schedules are in agent.dm)
-        self._generate_encounter_events()
+        # God Model encounter events DISABLED — replaced by real-time
+        # WorldState-based encounter detection in the phase loop below.
+        # self._generate_encounter_events()
 
-        # Stage 5: activity
+        # Stage 5: activity (day × phase double loop)
         self.clock.set_stage(Stage.ACTIVITY)
+
+        # Initialise WorldState for the ACTIVITY stage lifecycle
+        agent_names = [a.name for a in self.agents]
+        self.world_state = WorldState(agent_names)
+        n_phases = len(self.clock.get_phases())
+        self.logger.info(f"Day phases: {n_phases} phase(s) per day")
+
         for day in range(1, self.config["time"]["n_day"] + 1):
             self.clock.set_day(day)
-            t = self.clock.get_time()
 
-            # Build today's activities (all types)
-            public_acts, joint_acts, encounter_acts, solo_acts = (
-                self._build_today_activities_all_types()
-            )
+            for phase in self.clock.get_phases():
+                self.clock.set_phase(phase)
+                self.world_state.set_phase(phase)
+                t = self.clock.get_time()
 
-            self.logger.info(
-                f"== ACTIVITY STAGE == year={t.year} week={t.week} day={t.day} | "
-                f"joint={len(joint_acts)} encounter={len(encounter_acts)} "
-                f"public={len(public_acts)} solo={len(solo_acts)}"
-            )
+                # --- Phase: update positions from schedules ---
+                for agent in self.agents:
+                    schd = agent.get_schedule()
+                    if schd is not None and schd.location:
+                        self.world_state.update_position(agent.name, schd.location)
+                    elif self.world_state.get_position(agent.name) is None:
+                        # Idle agent: assign random public location
+                        public_locs, _ = self.location_store.list_all()
+                        if public_locs:
+                            self.world_state.update_position(
+                                agent.name, random.choice(sorted(public_locs))
+                            )
 
-            # Execute all activity types in parallel with Semaphore-based concurrency control
-            #
-            # Design:
-            # - Semaphore(max_concurrency) controls total concurrent tasks
-            # - Joint/Solo: 1 slot each (one concurrent task)
-            # - Public: N slots where N = min(participants, internal_parallelism)
-            #
-            # Submission order (priority):
-            # 1. Joint (bottleneck, slow, gets slots first)
-            # 2. Solo (fast, fills remaining slots)
-            # 3. Public (sorted by size, small first to release slots quickly)
-            if self.parallel:
-                from src.config import get_config
-                from threading import Semaphore
+                tracked = len(self.world_state._positions)
 
-                cfg = get_config()
-                max_concurrency = int(cfg["max_concurrency"])
+                # --- Phase: detect encounters (pure logic, before activities) ---
+                encounters = self.world_state.detect_encounters()
 
-                n_joint = len(joint_acts) + len(encounter_acts)
-                n_solo = len(solo_acts)
-                n_public = len(public_acts)
-
-                # Public internal parallelism from config (must be > 0)
-                public_internal_parallelism = int(
-                    self.config["public_activity"]["internal_parallelism"]
+                self.logger.info(
+                    f"[ACTIVITY] day={t.day}/5 phase={t.phase.name.lower() if t.phase else '?'} | "
+                    f"tracked={tracked} agents "
+                    f"| encounters={len(encounters)}"
                 )
-                if public_internal_parallelism <= 0:
-                    self.logger.error(
-                        f"internal_parallelism must be > 0, got {public_internal_parallelism}, forcing to 5"
+
+                # --- Phase: execute regular activities ---
+                # (per-phase activity building — runs each phase for
+                #  phase-specific activity construction)
+                public_acts, joint_acts, encounter_acts, solo_acts = (
+                    self._build_today_activities_all_types()
+                )
+
+                # Execute all activity types in parallel with
+                # Semaphore-based concurrency control
+                #
+                # Design:
+                # - Semaphore(max_concurrency) controls total concurrent tasks
+                # - Joint/Solo: 1 slot each (one concurrent task)
+                # - Public: N slots where N = min(participants, internal_parallelism)
+                #
+                # Submission order (priority):
+                # 1. Joint (bottleneck, slow, gets slots first)
+                # 2. Solo (fast, fills remaining slots)
+                # 3. Public (sorted by size, small first to release slots quickly)
+                if self.parallel:
+                    from src.config import get_config
+                    from threading import Semaphore
+
+                    cfg = get_config()
+                    max_concurrency = int(cfg["max_concurrency"])
+
+                    n_joint = len(joint_acts) + len(encounter_acts)
+                    n_solo = len(solo_acts)
+                    n_public = len(public_acts)
+
+                    # Public internal parallelism from config (must be > 0)
+                    public_internal_parallelism = int(
+                        self.config["public_activity"]["internal_parallelism"]
                     )
-                    public_internal_parallelism = 5
-
-                self.logger.debug(
-                    f"Activity parallel: joint={n_joint}, solo={n_solo}, "
-                    f"public={n_public}, public_internal={public_internal_parallelism}, "
-                    f"pool={max_concurrency}"
-                )
-
-                # Semaphore controls total concurrent tasks
-                capacity = Semaphore(max_concurrency)
-
-                def run_with_slots(fn, slots: int, *args, **kwargs):
-                    """Run function while holding `slots` semaphore permits."""
-                    for _ in range(slots):
-                        capacity.acquire()
-                    try:
-                        return fn(*args, **kwargs)
-                    finally:
-                        for _ in range(slots):
-                            capacity.release()
-
-                # Thread pool large enough for all tasks to be submitted
-                total_tasks = n_joint + n_solo + n_public
-                with ThreadPoolExecutor(max_workers=total_tasks) as ex:
-                    futures = []
-
-                    # Phase 1: Joint (1 slot each, highest priority)
-                    for act in joint_acts + encounter_acts:
-                        futures.append(ex.submit(run_with_slots, act.run, 1))
-
-                    # Phase 2: Solo (1 slot each, fast)
-                    for act in solo_acts:
-                        futures.append(ex.submit(run_with_slots, act.run, 1))
-
-                    # Phase 3: Public (sorted by participant count, small first)
-                    # Small Public completes faster, releases slots for others
-                    sorted_public = sorted(public_acts, key=lambda a: len(a.agents))
-                    for act in sorted_public:
-                        n_participants = len(act.agents)
-                        slots = min(n_participants, public_internal_parallelism)
-                        futures.append(
-                            ex.submit(run_with_slots, act.run, slots, parallel=True)
+                    if public_internal_parallelism <= 0:
+                        self.logger.error(
+                            f"internal_parallelism must be > 0, "
+                            f"got {public_internal_parallelism}, forcing to 5"
                         )
+                        public_internal_parallelism = 5
 
-                    # Wait for all
-                    for f in futures:
-                        f.result()
-            else:
-                # Sequential fallback
-                for act in joint_acts + encounter_acts:
-                    act.run()
-                for act in public_acts:
-                    act.run(parallel=False)
-                for act in solo_acts:
-                    act.run()
+                    self.logger.debug(
+                        f"Activity parallel: joint={n_joint}, solo={n_solo}, "
+                        f"public={n_public}, public_internal={public_internal_parallelism}, "
+                        f"pool={max_concurrency}"
+                    )
+
+                    # Semaphore controls total concurrent tasks
+                    capacity = Semaphore(max_concurrency)
+
+                    def run_with_slots(fn, slots: int, *args, **kwargs):
+                        """Run function while holding `slots` semaphore permits."""
+                        for _ in range(slots):
+                            capacity.acquire()
+                        try:
+                            return fn(*args, **kwargs)
+                        finally:
+                            for _ in range(slots):
+                                capacity.release()
+
+                    # Thread pool large enough for all tasks to be submitted
+                    total_tasks = n_joint + n_solo + n_public
+                    with ThreadPoolExecutor(max_workers=total_tasks) as ex:
+                        futures = []
+
+                        # Phase 1: Joint (1 slot each, highest priority)
+                        for act in joint_acts + encounter_acts:
+                            futures.append(ex.submit(run_with_slots, act.run, 1))
+
+                        # Phase 2: Solo (1 slot each, fast)
+                        for act in solo_acts:
+                            futures.append(ex.submit(run_with_slots, act.run, 1))
+
+                        # Phase 3: Public (sorted by participant count, small first)
+                        # Small Public completes faster, releases slots for others
+                        sorted_public = sorted(public_acts, key=lambda a: len(a.agents))
+                        for act in sorted_public:
+                            n_participants = len(act.agents)
+                            slots = min(n_participants, public_internal_parallelism)
+                            futures.append(
+                                ex.submit(run_with_slots, act.run, slots, parallel=True)
+                            )
+
+                        # Wait for all
+                        for f in futures:
+                            f.result()
+                else:
+                    # Sequential fallback
+                    for act in joint_acts + encounter_acts:
+                        act.run()
+                    for act in public_acts:
+                        act.run(parallel=False)
+                    for act in solo_acts:
+                        act.run()
+
+                # --- Phase: execute encounter dialogues via EncounterPipeline ---
+                # (detection already done above; now execute the actual LLM dialogs)
+                from src.world.encounter_pipeline import EncounterPipeline
+
+                pipeline = EncounterPipeline()
+                name2agent = self.by_name()
+                player_agent = name2agent.get("Player")
+                for enc_group in encounters:
+                    if len(enc_group.agent_names) < 2:
+                        continue
+
+                    pipeline.run(
+                        enc_group,
+                        name2agent,
+                        self.world_state,
+                        self.location_store,
+                        player_agent=player_agent,
+                    )
+
+                    # Post-encounter NPC follow logic (NPC-only encounters)
+                    if "Player" not in enc_group.agent_names:
+                        for name in enc_group.agent_names:
+                            if random.random() < 0.4:
+                                # 40% chance: follow another NPC to their next position
+                                others = [
+                                    n for n in enc_group.agent_names if n != name
+                                ]
+                                if others:
+                                    partner = random.choice(others)
+                                    partner_pos = self.world_state.get_position(
+                                        partner
+                                    )
+                                    if partner_pos and not partner_pos.startswith(
+                                        "home/"
+                                    ):
+                                        self.world_state.update_position(
+                                            name, partner_pos
+                                        )
+                                        self.logger.info(
+                                            f"[ACTIVITY] {name} changes plan → "
+                                            f"follows {partner} to {partner_pos}"
+                                        )
+
+                # --- Phase: advance actions ---
+                self.world_state.advance_actions(1.0 / n_phases)
+
+        # Stage complete — discard WorldState
+        self.world_state = None
 
         # Review phase
         self.clock.set_stage(Stage.REVIEW)
@@ -952,6 +1171,7 @@ class World:
             "joint": {},
             "public": {},
             "encounter": {},
+            "solo": {},
         }
 
         engaged: set[str] = set()
@@ -962,14 +1182,23 @@ class World:
                 continue
 
             at = schd.activity_time
-            assert at == t, (
-                f"Schedule time mismatch for {agent.name}: expected {t}, got {at}"
+            # Compare ignoring phase — schedules are stored at day granularity
+            # while the clock may carry phase info during ACTIVITY stage.
+            at_day = TimeState(at.year, at.week, at.stage, at.day, at.slot)
+            t_day = TimeState(t.year, t.week, t.stage, t.day, t.slot)
+            assert at_day == t_day, (
+                f"Schedule time mismatch for {agent.name}: expected {t_day}, got {at_day}"
             )
 
             stype = schd.type
             assert stype in schedules_by_type, (
                 f"Unknown schedule type '{stype}' for {agent.name}"
             )
+
+            # Solo schedules are handled separately at the end —
+            # they don't participate in joint/encounter/public building.
+            if stype == "solo":
+                continue
 
             aid = schd.activity_id
             if aid not in schedules_by_type[stype]:
@@ -1053,6 +1282,138 @@ class World:
         ]
 
         return public_acts, joint_acts, encounter_acts, solo_acts
+
+    # Player Encounter ---------------------------------------------------------
+    def _run_player_encounter(
+        self,
+        enc_group,
+        participants: list,
+        name2agent: dict,
+    ) -> None:
+        """Run a Player-involved encounter using input()-based dialogue.
+
+        Instead of the God Model orchestration used in JointActivity.run(),
+        this method runs a simple turn-by-turn dialogue:
+        - NPC agents use their LLM (act_in_activity) to respond
+        - Player uses terminal input() to respond
+
+        Args:
+            enc_group: EncounterGroup with agent_names and location
+            participants: List of agent objects in the encounter
+            name2agent: Dict mapping name -> agent
+        """
+        player_agent = name2agent.get("Player")
+        npc_agents = [a for a in participants if a.name != "Player"]
+
+        if not player_agent or not npc_agents:
+            return
+
+        cfg = get_world_config()
+        max_turns = int(cfg["activity"]["joint_activity_max_turns"])
+        min_turns = int(cfg["activity"]["joint_activity_min_turns"])
+
+        location_desc = (
+            self.location_store.get_surroundings_text(enc_group.location)
+            if enc_group.location
+            else ""
+        )
+
+        activity_background = (
+            f"Encounter between {', '.join(enc_group.agent_names)} "
+            f"at {enc_group.location or 'an unknown location'}."
+        )
+
+        agent_names = list(enc_group.agent_names)
+
+        # Initialize NPC contexts
+        for npc in npc_agents:
+            npc.enter_joint_activity(
+                activity_background=activity_background,
+                activity_type="joint",
+                participants=agent_names,
+                location_desc=location_desc,
+            )
+
+        # Initialize Player context
+        player_agent.enter_joint_activity(
+            activity_background=activity_background,
+            activity_type="joint",
+            participants=agent_names,
+            location_desc=location_desc,
+        )
+
+        print(f"\n{'='*60}")
+        print(f"[偶遇] 你在 {enc_group.location or '某个地方'} 遇到了:")
+        for npc in npc_agents:
+            print(f"  - {npc.name}")
+        print(f"{'='*60}")
+
+        # Simple turn-by-turn dialogue: NPC speaks first, then Player responds,
+        # then next NPC, etc.
+        # Build an interleaved order: NPC, Player, NPC, Player, ...
+        dialogue_order: List[str] = []
+        for turn in range(max_turns):
+            for npc in npc_agents:
+                dialogue_order.append(npc.name)
+            dialogue_order.append("Player")
+
+        last_npc_line = ""
+        last_speaker = ""
+
+        for i, speaker_name in enumerate(dialogue_order):
+            if speaker_name == "Player":
+                if not last_npc_line:
+                    continue  # Skip if no NPC has spoken yet
+                reply = player_agent.player_dialogue(last_speaker, last_npc_line)
+                if reply:
+                    # Broadcast Player's reply to all NPCs
+                    for npc in npc_agents:
+                        npc.receive_in_activity(f"[{player_agent.name}]: {reply}")
+                last_speaker = player_agent.name
+            else:
+                npc = name2agent[speaker_name]
+                try:
+                    resp = npc.act_in_activity(activity_type="joint", i_turn=i + 1)
+                    # Extract clean text from resp
+                    last_npc_line = resp
+                    last_speaker = speaker_name
+
+                    # Broadcast to all other participants (including Player)
+                    for other in participants:
+                        if other.name != speaker_name:
+                            other.receive_in_activity(
+                                f"[{speaker_name}]: {resp}"
+                            )
+                except Exception:
+                    self.logger.warning(
+                        f"[PLAYER ENCOUNTER] NPC {speaker_name} generation failed",
+                        exc_info=True,
+                    )
+                    last_npc_line = f"{speaker_name} looks at you expectantly."
+                    last_speaker = speaker_name
+                    for other in participants:
+                        if other.name != speaker_name:
+                            other.receive_in_activity(
+                                f"[{speaker_name}]: {last_npc_line}"
+                            )
+
+            # Allow early exit
+            if i >= min_turns * len(participants) and last_speaker == "Player":
+                # After player speaks, check if they want to end
+                pass  # Continue until max turns or explicit exit
+
+        # Exit dialogue for NPCs
+        for npc in npc_agents:
+            try:
+                npc.exit_activity("joint")
+            except Exception:
+                self.logger.warning(
+                    f"[PLAYER ENCOUNTER] exit_activity failed for {npc.name}",
+                    exc_info=True,
+                )
+
+        # Clean up Player context
+        player_agent.activity_context = None
 
     # Public Stage Methods ----------------------------------------------------
     def _generate_public_events(self) -> List[PublicEvent]:
@@ -1301,10 +1662,11 @@ class World:
 
         if self.parallel:
             with ThreadPoolExecutor(max_workers=pool_size(len(self.agents))) as ex:
-                results = list(ex.map(update_and_collect, self.agents))
+                results = list(ex.map(update_and_collect, [a for a in self.agents if a.name != "Player"]))
         else:
             for agent in self.agents:
-                results.append(update_and_collect(agent))
+                if agent.name != "Player":
+                    results.append(update_and_collect(agent))
 
         if verify_logger:
             # Log all results

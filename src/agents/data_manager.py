@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import fcntl
 import json
+from src.filelock import flock_exclusive, flock_unlock
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from file_read_backwards import FileReadBackwards
 import os
 
-from src.world.clock import Clock, TimeState, Stage
+from src.world.clock import Clock, TimeState, Stage, DayPhase
 from src.world.scheduling import Schedule
 from src.world.locations import get_location_store
 from src.world.position_application import Position
@@ -174,7 +174,7 @@ class DataManager:
         _ensure_dir(path.parent)
         new_t = TimeState.from_string(obj["time"])
         with path.open("a+", encoding="utf-8") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            flock_exclusive(f)
             try:
                 # Check time ordering: new entry must not be earlier than last entry
                 f.seek(0, 2)  # seek to end
@@ -224,7 +224,7 @@ class DataManager:
                 f.write(json.dumps(obj, ensure_ascii=False) + "\n")
                 f.flush()
             finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                flock_unlock(f)
 
     def _write_json_new(self, path: Path, data: Dict) -> None:
         """Write JSON file (overwrite mode, expects path not to exist).
@@ -1126,13 +1126,40 @@ class DataManager:
         return f"## Current Time:\n{str(t)} (year={t.year}, week={t.week}, stage={t.stage.name.lower()}).\n\n"
 
     def plan_prompt(self) -> List[Dict[str, str]]:
-        """Build weekly planning messages with persona text and time context."""
+        """Build weekly planning messages with persona text and time context.
 
-        from src.agents.prompts import PLAN_PROMPT
+        When n_phases > 1, injects phase-aware planning instructions that ask
+        the agent to plan one activity per phase per day, with structured output.
+        When n_phases == 1, degrades to the original single-activity-per-day prompt.
+        """
+
+        from src.agents.prompts import PLAN_PROMPT, PLAN_PROMPT_MULTI_PHASE
+
+        phases = self.clock.get_phases()
+        n_phases = len(phases)
+        n_day = int(config["world"]["time"]["n_day"])
+
+        if n_phases > 1:
+            phase_labels = [DayPhase.label(p) for p in phases]
+            phase_names_str = ", ".join(phase_labels)
+            total_slots = n_day * n_phases
+            first_phase = phase_labels[0]
+            second_phase = phase_labels[1] if n_phases >= 2 else ""
+            phase_instruction = PLAN_PROMPT_MULTI_PHASE.format(
+                n_day=n_day,
+                n_phases=n_phases,
+                phase_names=phase_names_str,
+                total_slots=total_slots,
+                first_phase=first_phase,
+                second_phase=second_phase,
+            )
+            prompt_content = PLAN_PROMPT + "\n\n" + phase_instruction
+        else:
+            prompt_content = PLAN_PROMPT
 
         parts = [
             self.list_schedule(),
-            PLAN_PROMPT,
+            prompt_content,
         ]
 
         prompt = "\n\n".join([h.strip() for h in parts if h.strip() != ""])
@@ -2283,6 +2310,12 @@ class DataManager:
                 # Encounter: system-arranged meeting; not shown in list_schedule for the LLM.
                 # Agent has no foreknowledge — learns about it only when it executes that day.
                 continue
+            elif sch.type == "solo":
+                # Solo activity: individual free time
+                loc_str = f"; location: {sch.location}" if sch.location else ""
+                parts.append(
+                    f"- [Solo] {sch.activity_name} at {sch.activity_time}{loc_str}"
+                )
             else:
                 # Unknown type, show basic info
                 raise ValueError(f"Unknown activity type: {sch.type}")
@@ -2307,23 +2340,42 @@ class DataManager:
         return busy_days
 
     def get_today_schedule(self) -> Schedule | None:
-        """Return the unique Schedule for 'today' or None.
+        """Return the unique Schedule for 'today' (current day + phase) or None.
 
         - Uses _read_jsonl week-window reading (handles cross-year automatically).
         - Parses each row's activity_time as a TimeState and compares to today's t.
+        - When n_phases > 1, filters by current phase as well.
         - Asserts at most one activity per day (raises if multiple found).
         """
         t = self.clock.get_time()
-        return self.get_schedule_for_day(t.year, t.week, t.day)
+        return self.get_schedule_for_day_phase(t.year, t.week, t.day, t.phase)
 
     # Priority: joint > public > encounter (higher number wins)
-    _SCHEDULE_TYPE_PRIORITY = {"encounter": 0, "public": 1, "joint": 2}
+    _SCHEDULE_TYPE_PRIORITY = {"solo": -1, "encounter": 0, "public": 1, "joint": 2}
 
     def get_schedule_for_day(self, year: int, week: int, day: int) -> Schedule | None:
-        """Return the highest-priority Schedule for a specific day or None.
+        """Return the highest-priority Schedule for a specific day or None. (alias)
+
+        Delegates to get_schedule_for_day_phase with phase=None (wildcard).
+        """
+        return self.get_schedule_for_day_phase(year, week, day)
+
+    def get_schedule_for_day_phase(
+        self, year: int, week: int, day: int, phase: Optional[DayPhase] = None
+    ) -> Schedule | None:
+        """Return the highest-priority Schedule for a specific day (and optionally phase).
 
         When multiple schedules exist for the same day, priority is
         determined by type: joint > public > encounter.
+
+        Args:
+            year: Target year.
+            week: Target week.
+            day: Target day (1-indexed).
+            phase: Optional DayPhase to match exactly.
+                   When None (default), matches any phase — compatible with legacy data.
+                   When set, only returns schedules whose activity_time.phase equals this value.
+
         Within the same type, the last-written entry wins.
         """
         n_weeks = int(config["world"]["contact"]["max_weeks_for_future_schedule"])
@@ -2342,6 +2394,10 @@ class DataManager:
                 continue
             at = sch.activity_time
             if at.year == year and at.week == week and at.day == day:
+                # Phase filter: when phase is specified, match exact phase or
+                # treat at.phase=None as a wildcard (legacy / day-level schedules).
+                if phase is not None and at.phase is not None and at.phase != phase:
+                    continue
                 filtered.append(sch)
 
         if not filtered:
@@ -2462,7 +2518,7 @@ class DataManager:
             return
 
         with jsonl_path.open("r+b") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            flock_exclusive(f)
             try:
                 # Find start of last line (byte-level seek for UTF-8 safety)
                 f.seek(0, 2)
@@ -2493,7 +2549,7 @@ class DataManager:
                 f.truncate()
                 f.write(json.dumps(record, ensure_ascii=False).encode("utf-8") + b"\n")
             finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                flock_unlock(f)
 
     # ---------- Activity Outcome Support ----------
     def apply_activity_outcome(

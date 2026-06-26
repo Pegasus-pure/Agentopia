@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Optional
 
 from src.config import get_config
 
@@ -22,6 +23,44 @@ class Stage(IntEnum):
     SETTLE = 7
 
 
+class DayPhase(IntEnum):
+    """Phases within a single day (ACTIVITY stage).
+
+    Values start at 1 for natural ordering.
+    """
+
+    DAWN = 1
+    MORNING = 2
+    AFTERNOON = 3
+    DUSK = 4
+    NIGHT = 5
+
+    @staticmethod
+    def from_config(config_section: dict) -> list["DayPhase"]:
+        """Return the list of DayPhases for the current configuration.
+
+        Reads n_phases from the day_phases config section and returns
+        the first N DayPhase values.  For n_phases=1 (degraded mode)
+        this returns [DAWN].
+        """
+        n_phases = config_section.get("n_phases", 5)
+        all_phases = [
+            DayPhase.DAWN,
+            DayPhase.MORNING,
+            DayPhase.AFTERNOON,
+            DayPhase.DUSK,
+            DayPhase.NIGHT,
+        ]
+        return all_phases[:n_phases]
+
+    @staticmethod
+    def label(phase: "DayPhase") -> str:
+        """Return the human-readable label for a DayPhase from config."""
+        day_phases_cfg = config["world"]["time"].get("day_phases", {})
+        labels = day_phases_cfg.get("labels", {})
+        return labels.get(phase.name.lower(), phase.name.capitalize())
+
+
 @functools.total_ordering
 @dataclass
 class TimeState:
@@ -30,11 +69,15 @@ class TimeState:
     stage: Stage
     day: int = 0
     slot: int = 0
+    phase: Optional[DayPhase] = None
 
     def __str__(self) -> str:
         """Convert this TimeState to its string representation.
 
-        - ACTIVITY stage: "Y{year}-W{week}-activity-D{day}"
+        - ACTIVITY stage (with phase, n_phases>1):
+            "Y{year}-W{week}-activity-D{day}-P{phase_name}"
+        - ACTIVITY stage (no phase or n_phases=1):
+            "Y{year}-W{week}-activity-D{day}"
         - CONTACT stage:  "Y{year}-W{week}-contact-S{slot}"
         - Other stages:   "Y{year}-W{week}-{stage}"
         """
@@ -43,6 +86,12 @@ class TimeState:
             parts.append(f"S{self.slot}")
         elif self.stage == Stage.ACTIVITY:
             parts.append(f"D{self.day}")
+            if self.phase is not None:
+                # Suppress -P suffix in degraded mode (n_phases == 1)
+                day_phases_cfg = config["world"]["time"].get("day_phases", {})
+                n_phases = day_phases_cfg.get("n_phases", 5)
+                if n_phases > 1:
+                    parts.append(f"P{{{self.phase.name.lower()}}}")
         return "-".join(parts)
 
     def repr_week(self) -> str:
@@ -56,6 +105,7 @@ class TimeState:
         Supported formats:
         - "Y{year}-W{week}-{stage}" (e.g. "Y2025-W01-plan")
         - "Y{year}-W{week}-{stage}-D{day}" (e.g. "Y2025-W01-activity-D3")
+        - "Y{year}-W{week}-{stage}-D{day}-P{phase}" (e.g. "Y2025-W01-activity-D3-P{morning}")
         - "Y{year}-W{week}-{stage}-S{slot}" (e.g. "Y2025-W01-contact-S6")
         """
         parts = s.split("-")
@@ -79,10 +129,11 @@ class TimeState:
             )
         week = int(parts[1][1:])
 
-        # 3. Parse Stage / Day / Slot
+        # 3. Parse Stage / Day / Slot / Phase
         stage: Stage
         day = 0
         slot = 0
+        phase: Optional[DayPhase] = None
 
         p2 = parts[2]
 
@@ -93,8 +144,12 @@ class TimeState:
                 day = int(part[1:])
             elif part.startswith("S"):
                 slot = int(part[1:])
+            elif part.startswith("P"):
+                # Phase suffix: "P{morning}" → DayPhase.MORNING
+                phase_name = part[1:].strip("{}")
+                phase = DayPhase[phase_name.upper()]
 
-        return cls(year=year, week=week, stage=stage, day=day, slot=slot)
+        return cls(year=year, week=week, stage=stage, day=day, slot=slot, phase=phase)
 
     def __eq__(self, other: object) -> bool:
         """Return True if all time components are equal."""
@@ -106,6 +161,7 @@ class TimeState:
             and self.stage == other.stage
             and self.day == other.day
             and self.slot == other.slot
+            and self.phase == other.phase
         )
 
     def __lt__(self, other: object) -> bool:
@@ -127,6 +183,14 @@ class TimeState:
         elif self.stage == Stage.ACTIVITY:
             if self.day != other.day:
                 return self.day < other.day
+            # Same day: compare phase (None comes before any phase)
+            if self.phase is None and other.phase is not None:
+                return True
+            if self.phase is not None and other.phase is None:
+                return False
+            if self.phase is not None and other.phase is not None:
+                if self.phase != other.phase:
+                    return self.phase < other.phase
 
         return False
 
@@ -172,6 +236,7 @@ class Clock:
         self._stage: Stage = Stage.BEGIN
         self._day: int = 0
         self._slot: int = 0
+        self._phase: Optional[DayPhase] = None
 
     def set_year(self, year: int) -> None:
         self._year = year
@@ -187,15 +252,63 @@ class Clock:
         # Reset granular fields when stage changes
         self._day = 0
         self._slot = 0
+        self._phase = None
 
     def set_day(self, day: int) -> None:
         self._day = day
+        self._phase = None
 
     def set_slot(self, slot: int) -> None:
         self._slot = slot
 
+    def set_phase(self, phase: DayPhase) -> None:
+        """Set the current day phase within ACTIVITY stage."""
+        self._phase = phase
+
+    def advance_phase(self) -> Optional[DayPhase]:
+        """Advance to the next day phase.
+
+        Returns:
+            The next DayPhase, or None if the current phase is the last
+            one of the day (i.e., the day has ended).
+        """
+        phases = self.get_phases()
+        if not phases:
+            return None
+        if self._phase is None:
+            # Start from the first phase
+            self._phase = phases[0]
+            return self._phase
+        # Find current phase index
+        try:
+            idx = phases.index(self._phase)
+        except ValueError:
+            # Current phase not in configured phases; reset to first
+            self._phase = phases[0]
+            return self._phase
+        if idx + 1 < len(phases):
+            self._phase = phases[idx + 1]
+            return self._phase
+        # Last phase reached; day ends
+        self._phase = None
+        return None
+
+    @property
+    def phase(self) -> Optional[DayPhase]:
+        """Return the current day phase (read-only)."""
+        return self._phase
+
+    def get_phases(self) -> list[DayPhase]:
+        """Return the ordered list of DayPhases for the current day.
+
+        Reads the day_phases configuration dynamically.  Supports degraded
+        mode (n_phases=1) which returns a single-element list.
+        """
+        day_phases_cfg = config["world"]["time"].get("day_phases", {})
+        return DayPhase.from_config(day_phases_cfg)
+
     def get_time(self) -> TimeState:
-        return TimeState(self._year, self._week, self._stage, self._day, self._slot)
+        return TimeState(self._year, self._week, self._stage, self._day, self._slot, self._phase)
 
     # Utilities for contact stage -------------------------------------------
     def prev_contact_slot(self) -> TimeState:

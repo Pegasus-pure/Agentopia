@@ -1,5 +1,9 @@
 # Secrets
 gemini_key.json
+.env
+
+# Config (keep example only)
+config.json
 
 # Local IDE / tool settings
 .claude/settings.local.json
@@ -17,3 +21,14 @@ build/
 
 # OS
 .DS_Store
+
+# Project-specific exclusions
+logs/
+llm_cache/
+nul/
+tasks.md
+commands.txt
+analysis/
+analyze/
+tests/
+data/apartment_06252117/

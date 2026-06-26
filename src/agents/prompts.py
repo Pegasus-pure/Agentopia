@@ -325,6 +325,38 @@ Choose ONE of the following options (lowercase, no quotes):
 Example: <living_standard>moderate</living_standard>
 """
 
+PLAN_PROMPT_MULTI_PHASE = """### Multi-Phase Weekly Planning (Extended)
+
+This week has **{n_day} days**, and each day is divided into **{n_phases} time phases**: {phase_names}.
+
+For each day, you should plan **one activity per phase** — that means {n_phases} activities per day, for a total of up to {n_day} × {n_phases} = {total_slots} activities this week.
+
+**Phase Planning Rules:**
+- Each phase represents a distinct time slot during the day. Plan activities appropriate to the time of day (e.g., morning activities for morning phases, evening activities for night phases).
+- You may leave a phase empty if you have no specific plan for that time.
+- You can schedule different types of activities across phases: solo activities for personal time, joint activities for social time, etc.
+- Check your existing schedule — if a phase already has a joint or public activity booked, do not plan another activity for that phase.
+
+**Output Format (Structured):**
+Your plan should be organized by day and phase. Include it in both your scratchpad and final answer using this structure:
+
+```
+## Weekly Plan
+### Day 1
+- [Phase: {first_phase}] Activity description
+- [Phase: {second_phase}] Activity description
+...
+
+### Day 2
+- [Phase: {first_phase}] Activity description
+...
+```
+
+(Replace `{first_phase}`, `{second_phase}`, etc. with the actual phase names.)
+
+**Important:** When n_phases=1, this section is not shown and the standard single-activity-per-day planning applies.
+"""
+
 CONTACT_PROMPT_BRIEF = """In this phase, you can contact other people by sending 'text messages' and arrange joint activities through communication."""
 
 CONTACT_PROMPT = f"""## Instructions for Contact Stage

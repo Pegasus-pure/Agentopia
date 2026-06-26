@@ -961,7 +961,11 @@ def _call_openai_chat(model, messages, functions, tool_choice, max_tokens, **kwa
 
     model_config = config["models"][model]
     base_url = model_config["url"].rstrip("/") + "/"
-    api_key = model_config["api_key"]
+    # Support api_key_env_var to read API key from environment variable
+    if "api_key_env_var" in model_config:
+        api_key = os.getenv(model_config["api_key_env_var"], "")
+    else:
+        api_key = model_config.get("api_key", "")
     client = OpenAI(base_url=base_url, api_key=api_key)
     client = client.with_options(timeout=kwargs.pop("timeout", 600))
 
@@ -1000,8 +1004,13 @@ def _call_azure_responses(
 ):
     """GPT-5 via Azure OpenAI Responses API."""
     model_config = config["models"][model]
+    # Support api_key_env_var for reading API key from environment variable
+    if "api_key_env_var" in model_config:
+        _api_key = os.getenv(model_config["api_key_env_var"], "")
+    else:
+        _api_key = os.getenv("AZURE_OPENAI_API_KEY", model_config.get("api_key", ""))
     client = openai.AzureOpenAI(
-        api_key=os.getenv("AZURE_OPENAI_API_KEY", model_config["api_key"]),
+        api_key=_api_key,
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", model_config["url"]),
         api_version=os.getenv("AZURE_OPENAI_API_VERSION", model_config["api_version"]),
         timeout=180,
@@ -1107,7 +1116,11 @@ def generate_with_fc(
 
             # Allow environment variables to override URL and API key
             base_url = os.getenv("OPENAI_BASE_URL", model_cfg["url"])
-            api_key = os.getenv("OPENAI_API_KEY", model_cfg["api_key"])
+            # Support api_key_env_var to read API key from environment variable
+            if "api_key_env_var" in model_cfg:
+                api_key = os.getenv(model_cfg["api_key_env_var"], "")
+            else:
+                api_key = os.getenv("OPENAI_API_KEY", model_cfg.get("api_key", ""))
             client = OpenAI(base_url=base_url, api_key=api_key)
 
             # Set per-request timeout on the client instance
@@ -1373,7 +1386,11 @@ def generate_with_fc(
             from anthropic import Anthropic
 
             # 1. Initialize client
-            api_key = os.getenv("ANTHROPIC_API_KEY", model_cfg["api_key"])
+            # Support api_key_env_var to read API key from environment variable
+            if "api_key_env_var" in model_cfg:
+                api_key = os.getenv(model_cfg["api_key_env_var"], "")
+            else:
+                api_key = os.getenv("ANTHROPIC_API_KEY", model_cfg.get("api_key", ""))
             client = Anthropic(api_key=api_key)
             logger.info(f"[CLAUDE_CALL] Anthropic client initialized")
 

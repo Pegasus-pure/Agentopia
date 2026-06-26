@@ -1,0 +1,60 @@
+{
+  "name": "Player",
+  "gender": "?",
+  "appearance_and_impression": "A newcomer to the neighborhood.",
+  "brief_introduction": "Player character.",
+  "talents": {
+    "qualitative": "",
+    "quantitative": {
+      "health": 80,
+      "intelligence": 80,
+      "creativity": 80,
+      "communication": 80,
+      "integrity": 80,
+      "honesty": 80,
+      "trustworthiness": 80,
+      "leadership": 80,
+      "beauty": 80
+    }
+  },
+  "details": "The player has just moved in.",
+  "conflicts": "",
+  "core_motivation": "Start a new life.",
+  "personality_traits": {
+    "qualitative": "",
+    "quantitative": {
+      "confidence": 50,
+      "control": 50,
+      "curiosity": 50,
+      "empathy": 50,
+      "judging": 50,
+      "introversion": 50,
+      "intuition": 50,
+      "patience": 50,
+      "responsibility": 50,
+      "thinking": 50
+    }
+  },
+  "preferences": "",
+  "position": {
+    "weekly_income": 200,
+    "role": "Newcomer",
+    "organization": "Apartment Complex",
+    "type": "non-work",
+    "description": "Recently moved in.",
+    "weekly_delta_skills": {}
+  },
+  "init_skills": {
+    "social": 100,
+    "writing": 100,
+    "fitness": 100
+  },
+  "init_assets": {
+    "deposit": 2000,
+    "possessions": []
+  },
+  "extra_income": 0,
+  "values": "The player is a newcomer looking to build a life from scratch.",
+  "birthday": "Y2000-W1-activity-D1",
+  "birth_year": 2000
+}
