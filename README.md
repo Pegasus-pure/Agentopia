@@ -84,4 +84,4 @@ All extensions are **non-intrusive**:
 
 ---
 
-Forked from [Neph0s/Agentopia](https://github.com/Neph0s/Agentopia). Original README available in [`docs/README_original.md`](docs/README_original.md).
+Forked from [Neph0s/Agentopia](https://github.com/Neph0s/Agentopia).
