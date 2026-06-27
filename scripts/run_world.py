@@ -55,14 +55,6 @@ def main() -> None:
         help="Maximum number of agents to bootstrap from data (default: no limit)",
     )
     parser.add_argument(
-        "--player",
-        dest="player",
-        type=str,
-        choices=["on", "off"],
-        default=None,
-        help="Player mode: 'on' or 'off' (overrides config.enable_player)",
-    )
-    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging for world/utils/agents",
@@ -246,18 +238,14 @@ def main() -> None:
     set_run_cache_dir(data_dir)
 
     from src.config import get_config
-    from src.world.world import World
+
+    cfg = get_config()
+    player_enabled = cfg.get("world", {}).get("enable_player", False)
 
     # Determine resume_from: CLI override or auto-detect from checkpoint
     resume_from = resume_from_parsed if (args.run_id or args.resume) else None
 
-    # Resolve player mode: CLI --player on/off > config.enable_player
-    if args.player == "on":
-        player_enabled = True
-    elif args.player == "off":
-        player_enabled = False
-    else:
-        player_enabled = None  # use config default
+    from src.world.world import World
 
     w = World(
         no_context_engineering=args.no_ce,
@@ -337,5 +325,5 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# python scripts/run_world.py --year 1 --week 5 --parallel
+# python scripts/run_world.py --years 1 --weeks 5          (follows config.json enable_player)
 # python -m src.utils
