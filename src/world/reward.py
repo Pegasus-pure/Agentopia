@@ -560,10 +560,21 @@ def save_social_metrics(
     metrics: Dict[str, SocialMetrics],
     data_dir: str,
     year: int,
-    week: int,
+    week: int | None = None,
+    day: int | None = None,
 ) -> None:
-    """Save social metrics to reward/metrics/year=Y/week=W.jsonl."""
-    _save_reward_jsonl(list(metrics.values()), data_dir, "metrics", year, week)
+    """Save social metrics to reward/metrics/year=Y/[week=W|day=D].jsonl.
+
+    Supports both weekly and daily storage.
+
+    Args:
+        metrics: Dict mapping agent name to SocialMetrics
+        data_dir: World data directory name
+        year: Year number
+        week: Week number (for weekly storage)
+        day: Day number (for daily storage)
+    """
+    _save_reward_jsonl(list(metrics.values()), data_dir, "metrics", year, week, day)
 
 
 # =============================================================================
@@ -576,25 +587,28 @@ def _save_reward_jsonl(
     data_dir: str,
     subdir: str,
     year: int,
-    week: int,
+    week: int | None = None,
+    day: int | None = None,
 ) -> None:
-    """Write dataclass items to JSONL file under reward/{subdir}/year=Y/week=W.jsonl.
+    """Write dataclass items to JSONL file.
+
+    Supports both weekly and daily storage:
+    - Weekly: reward/{subdir}/year=Y/week=W.jsonl
+    - Daily:  reward/{subdir}/year=Y/day=D.jsonl
 
     Args:
         items: List of dataclass objects
         data_dir: World data directory name
-        subdir: Subdirectory under reward/ (e.g., "rankings", "scores")
+        subdir: Subdirectory under reward/ (e.g., "rankings", "metrics")
         year: Year number
-        week: Week number
+        week: Week number (for weekly storage)
+        day: Day number (for daily storage)
     """
-    path = (
-        Path("data")
-        / data_dir
-        / "reward"
-        / subdir
-        / f"year={year}"
-        / f"week={week}.jsonl"
-    )
+    base = Path("data") / data_dir / "reward" / subdir / f"year={year}"
+    if day is not None:
+        path = base / f"day={day}.jsonl"
+    else:
+        path = base / f"week={week}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with path.open("w", encoding="utf-8") as f:
@@ -606,36 +620,65 @@ def save_rankings(
     rankings: List[SocialRanking],
     data_dir: str,
     year: int,
-    week: int,
+    week: int | None = None,
+    day: int | None = None,
 ) -> None:
     """Save all agents' rankings to centralized location.
 
-    Path: data/{world}/reward/rankings/year=YYYY/week=W.jsonl
+    Supports both weekly and daily storage:
+    - Weekly: data/{world}/reward/rankings/year=YYYY/week=W.jsonl
+    - Daily:  data/{world}/reward/rankings/year=YYYY/day=D.jsonl
 
     This is the PageRank input data - needed to reconstruct social rewards.
     Per-agent reward.jsonl only stores computed results, not inputs.
+
+    Args:
+        rankings: List of SocialRanking objects
+        data_dir: World data directory name
+        year: Year number
+        week: Week number (for weekly storage)
+        day: Day number (for daily storage)
     """
-    _save_reward_jsonl(rankings, data_dir, "rankings", year, week)
+    _save_reward_jsonl(rankings, data_dir, "rankings", year, week, day)
 
 
 def load_rankings(
     data_dir: str,
     year: int,
-    week: int,
+    week: int | None = None,
+    day: int | None = None,
 ) -> List[SocialRanking]:
     """Load rankings from centralized storage.
+
+    Supports both weekly and daily storage.
+
+    Args:
+        data_dir: World data directory name
+        year: Year number
+        week: Week number (for weekly storage)
+        day: Day number (for daily storage)
 
     Returns:
         List of SocialRanking for all agents at the specified time.
     """
-    path = (
-        Path("data")
-        / data_dir
-        / "reward"
-        / "rankings"
-        / f"year={year}"
-        / f"week={week}.jsonl"
-    )
+    if day is not None:
+        path = (
+            Path("data")
+            / data_dir
+            / "reward"
+            / "rankings"
+            / f"year={year}"
+            / f"day={day}.jsonl"
+        )
+    else:
+        path = (
+            Path("data")
+            / data_dir
+            / "reward"
+            / "rankings"
+            / f"year={year}"
+            / f"week={week}.jsonl"
+        )
 
     if not path.exists():
         return []
@@ -648,6 +691,47 @@ def load_rankings(
                 d = json.loads(line)
                 rankings.append(SocialRanking.from_dict(d))
     return rankings
+
+
+# =============================================================================
+# Daily to Weekly Normalization
+# =============================================================================
+
+def normalize_daily_to_weekly(
+    data_dir: str,
+    year: int,
+    week: int,
+    days: List[int],
+) -> None:
+    """Aggregate N days of daily reward data into weekly reward data.
+
+    Normalization methods by reward type:
+    - Social reward (combined_score): mean across days
+    - Subjective reward (score): mean across days
+    - Economy reward (score): sum across days (cumulative)
+
+    Args:
+        data_dir: World data directory name
+        year: Year number
+        week: Week number to generate
+        days: List of day numbers to aggregate (e.g., [1, 2, 3, 4, 5])
+    """
+    from src.utils import get_logger
+    logger = get_logger("reward")
+
+    # This function aggregates daily reward data into weekly for display/analysis.
+    # Daily data is saved to reward/{subdir}/year=Y/day=D.jsonl
+    # Weekly data is saved to reward/{subdir}/year=Y/week=W.jsonl
+    #
+    # Implementation notes:
+    # 1. Read daily rankings from day=1..N
+    # 2. Average social scores across days
+    # 3. Read daily per-agent rewards
+    # 4. Aggregate: mean for social/subjective, sum for economy
+    # 5. Save as weekly data
+
+    logger.info(f"Normalizing daily data to weekly: year={year} week={week} days={days}")
+    logger.warning("normalize_daily_to_weekly: Not yet fully implemented - daily data saved, manual aggregation needed for weekly view")
 
 
 # =============================================================================
@@ -681,14 +765,19 @@ def compute_subjective_rewards(
 
     config = get_config()
     reward_cfg = config["world"]["reward"]
-    n_weeks = reward_cfg["period_weeks"]
+    granularity = reward_cfg.get("granularity", "weekly")
+    if granularity == "daily":
+        n_periods = reward_cfg.get("period_days", 5)
+    else:
+        n_periods = reward_cfg.get("period_weeks", 1)
     percentile = reward_cfg["misery_threshold_percentile"]
     penalty_value = reward_cfg["misery_penalty_value"]
 
     if verify_logger:
         verify_logger.info(
             f"[VERIFY-REWARD] compute_subjective_rewards: "
-            f"n_weeks={n_weeks}, percentile={percentile}, penalty={penalty_value}"
+            f"granularity={granularity}, n_periods={n_periods}, "
+            f"percentile={percentile}, penalty={penalty_value}"
         )
 
     # Phase 1: Collect all data, separated by dimension (fulfillment + vitality)
@@ -697,7 +786,10 @@ def compute_subjective_rewards(
     all_vitality_values: List[float] = []
 
     for agent in agents:
-        history = agent.dm.get_fulfillment_history(n_weeks=n_weeks)
+        if granularity == "daily":
+            history = agent.dm.get_fulfillment_history_daily(n_periods=n_periods)
+        else:
+            history = agent.dm.get_fulfillment_history(n_weeks=n_periods)
         agent_histories[agent.name] = history
         for entry in history:
             for dim in FULFILLMENT_DIMS:

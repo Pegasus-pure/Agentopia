@@ -121,7 +121,7 @@ class JointActivity(Activity):
     def _parse_gift_actions(
         self, response: str, sender_name: str
     ) -> Tuple[List[Tuple[str, str, str]], Dict[str, str]]:
-        """Parse <role_action>gift(...)</role_action> from response.
+        """Parse gift actions from [ACTION_JSON] blocks.
 
         Args:
             response: Agent's response text
@@ -133,9 +133,9 @@ class JointActivity(Activity):
                   (item_description is not available at parse time; added after _exec_gift)
                 - errs: Dict of {action_string: error_message} for parse errors
         """
-        import re
+        import json as _json
 
-        from src.utils import extract_role_action_blocks, parse_kv_args
+        from src.utils import extract_role_action_blocks
 
         gifts: List[Tuple[str, str, str]] = []
         errs: Dict[str, str] = {}
@@ -143,51 +143,43 @@ class JointActivity(Activity):
 
         for blk in blocks:
             s = blk.strip()
-            # Match action_name(args)
-            m = re.match(r"\s*(\w+)\s*\(\s*(.*)\s*\)\s*\Z", s, flags=re.DOTALL)
-            if not m:
-                errs[s] = "unparsable role_action block"
-                continue
-
-            act = m.group(0)
-            act_type = m.group(1).lower()
-            if act_type != "gift":
-                continue
-
-            args_raw = m.group(2)
             try:
-                args = parse_kv_args(args_raw)
-                to = str(args.get("to", "")).strip()
-                item = str(args.get("item", "")).strip()
-
-                if not to or not item:
-                    errs[act] = "gift action missing required params: to and item"
-                    continue
-
-                gifts.append((sender_name, to, item))
-            except Exception as e:
-                errs[act] = f"bad args for gift action: {e}"
+                data = _json.loads(s)
+            except (_json.JSONDecodeError, ValueError):
+                errs[s[:80]] = "unparsable JSON gift block"
                 continue
+            if not isinstance(data, dict) or data.get("type") != "gift":
+                continue
+            to_name = str(data.get("to", "")).strip()
+            item_name = str(data.get("item", "")).strip()
+            if not to_name or not item_name:
+                errs[s[:80]] = "gift JSON missing 'to' or 'item'"
+                continue
+            gifts.append((sender_name, to_name, item_name))
 
         return gifts, errs
 
     def _parse_exit_action(self, response: str) -> bool:
-        """Check if response contains exit_activity() action.
+        """Check if response contains an exit_activity action.
 
         Args:
             response: Agent's response text
 
         Returns:
-            True if exit_activity() action found, False otherwise
+            True if exit_activity action found, False otherwise
         """
-        import re
+        import json as _json
 
         from src.utils import extract_role_action_blocks
 
         for blk in extract_role_action_blocks(response):
-            s = blk.strip().lower()
-            if re.match(r"exit_activity\s*\(\s*\)", s):
-                return True
+            s = blk.strip()
+            try:
+                data = _json.loads(s)
+                if isinstance(data, dict) and data.get("type") == "exit_activity":
+                    return True
+            except (_json.JSONDecodeError, ValueError):
+                pass
         return False
 
     def _exec_gift(
@@ -793,8 +785,49 @@ class SoloActivity(Activity):
                 f"[VERIFY-SOLO-STEP1] Agent entered solo activity, context built"
             )
 
+        # ── P203: Solo 感知同位置其他人 ──
+        nearby_names = getattr(self, '_nearby_names', [])
+        if nearby_names:
+            nearby_agents = []
+            for nm in nearby_names:
+                # Try agent's own scratchpad first (NPC path)
+                sp_path = agent.dm.character_scratchpads / f"{nm}.jsonl"
+                # Fallback: Player reads from NPC's scratchpad (NPC→Player delta)
+                if not sp_path.exists() and agent.name == "Player":
+                    from pathlib import Path
+                    from src.world.god import _god_data_dir
+                    data_dir = Path("data") / (_god_data_dir or "school")
+                    sp_path = data_dir / "persona" / nm / "memory" / "scratchpad" / "characters" / "Player.jsonl"
+                if sp_path.exists():
+                    entries = agent.dm._read_jsonl(sp_path, max_lines=8)
+                    aff = sum(e.get("affection_delta", 0) for e in entries
+                              if "affection_delta" in e)
+                    resp = sum(e.get("respect_delta", 0) for e in entries
+                               if "respect_delta" in e)
+                    from src.utils import affection_label
+                    label = affection_label(aff, resp)
+                    aff_str = f"aff={'+' if aff >= 0 else ''}{aff}" if aff else ""
+                    resp_str = f"resp={'+' if resp >= 0 else ''}{resp}" if resp else ""
+                    detail = f" — {label} ({aff_str} {resp_str})".strip() if (aff_str or resp_str) else f" — {label}"
+                    nearby_agents.append(f"  {nm}{detail}")
+                else:
+                    nearby_agents.append(f"  {nm} (stranger)")
+            if nearby_agents:
+                perception = (
+                    f"\n\n## People Nearby\n"
+                    f"You notice the following people are also here:\n"
+                    + "\n".join(nearby_agents) +
+                    "\n\nYou may acknowledge them, avoid them, or focus on your own activity "
+                    "depending on how you feel about each person."
+                )
+                agent.receive_in_activity(perception)
+
         # Step 2: Agent acts (generates action/analysis)
-        action = agent.act_in_activity(activity_type="solo")
+        if hasattr(agent, '_batched_solo_outcome') and agent._batched_solo_outcome:
+            action = agent._batched_solo_outcome
+            agent._batched_solo_outcome = None
+        else:
+            action = agent.act_in_activity(activity_type="solo")
         # Save agent's LLM output for verification
         from src.utils import save_feature_generation
 
@@ -959,7 +992,33 @@ Or if you don't want to purchase anything:
                     )
 
                 # Agent decides what to purchase
-                purchase_response = agent.act_in_activity(activity_type="solo")
+                if type(agent).__name__ == "PlayerAgent":
+                    # Player: 终端菜单选择
+                    print(f"\n--- 消费选择 ---")
+                    print(outcome_text)
+                    print(f"\n当前余额: ${current_deposit}")
+                    print("可选商品:")
+                    for idx, opt in enumerate(consumption_options_offered):
+                        print(f"  [{idx+1}] {opt.name} - ${opt.price}")
+                        if opt.description:
+                            print(f"       {opt.description}")
+                    print(f"  [0] 不买")
+                    choice = input(f"选择 (0-{len(consumption_options_offered)}): ").strip()
+                    if choice.isdigit():
+                        ci = int(choice) - 1
+                        if 0 <= ci < len(consumption_options_offered):
+                            selected_name = consumption_options_offered[ci].name
+                        else:
+                            selected_name = "NONE"
+                    else:
+                        selected_name = "NONE"
+                    purchase_response = f"<buy>{selected_name}</buy>"
+                    if selected_name != "NONE":
+                        print(f"[OK] 你购买了: {selected_name}")
+                    else:
+                        print("[OK] 你没有购买任何东西")
+                else:
+                    purchase_response = agent.act_in_activity(activity_type="solo")
 
                 # Save agent's purchase decision LLM output
                 save_feature_generation(
@@ -1559,3 +1618,25 @@ class PublicActivity(Activity):
             logger.info(
                 f"[VERIFY-PUBLIC-ACT] ========== Public activity completed =========="
             )
+
+        # ── F2: Public 活动传播（零 LLM，直接写 rumor）──
+        try:
+            desc = getattr(self, "event_description", "") or self.activity_name
+            location = self.schedule.location or "unknown"
+            n = len(self.agents)
+            content = f"{self.activity_name} 在 {location} 举行：{desc[:150]}（共 {n} 人参加）"
+            for agent in self.agents:
+                try:
+                    agent.dm.append_rumor(
+                        content=content,
+                        topic="event",
+                        source_type="public_activity",
+                        source_location=location,
+                        fidelity=1.0,
+                        tags=[self.activity_name, location],
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            if logger:
+                logger.warning("[F2] Public activity rumor write failed", exc_info=True)

@@ -22,7 +22,6 @@ from src.agents.functions import FUNCTIONS, FUNCTION_SETS, dedupe_tool_calls
 from src.world.clock import Clock, Stage, TimeState
 from src.world.scheduling import MessageCenter
 from src.agents.data_manager import ERROR_LOGGER, DataManager
-from src.utils import parse_kv_args
 
 
 config = get_config()
@@ -65,6 +64,9 @@ class RoleAgent:
         self.proposed_activities: Dict[str, Dict[str, object]] = {}
 
         self.config = config
+
+        # activity_context 由 enter_joint_activity 初始化，F3 声明阶段也会用到
+        self.activity_context = None
 
     def _exec_function(
         self,
@@ -581,9 +583,23 @@ class RoleAgent:
         if not response:
             return []
 
-        # Parse <role_action>signup(event_name="...")</role_action> tags
-        pattern = r'<role_action>\s*signup\s*\(\s*event_name\s*=\s*["\']([^"\']+)["\']\s*\)\s*</role_action>'
-        matches = re.findall(pattern, response)
+        # Parse [ACTION_JSON] signup blocks
+        import json as _json
+
+        from src.utils import extract_role_action_blocks
+
+        blocks = extract_role_action_blocks(response)
+        matches = []
+        for blk in blocks:
+            s = blk.strip()
+            try:
+                data = _json.loads(s)
+                if isinstance(data, dict) and data.get("type") == "signup":
+                    name = data.get("event_name", "")
+                    if name:
+                        matches.append(str(name))
+            except (_json.JSONDecodeError, ValueError):
+                pass
 
         # Match names to events (normalize whitespace for comparison)
         name_to_event = {
@@ -651,7 +667,7 @@ class RoleAgent:
         - When slot==1, inject the contact-stage prompt; then inject the new
           messages received last round and the recent-history summary.
         - Generate text (read_* tools allowed, but no write-type tools provided).
-        - Parse <role_action> ... </role_action> from the output; supports
+        - Parse [ACTION_JSON] blocks from the output; supports
           contact / propose_joint_activity / respond_invitation / cancel_joint_activity.
         - Persist sends via the MessageCenter (if available) and DataManager.
         Returns the final text and the complete message sequence.
@@ -659,6 +675,18 @@ class RoleAgent:
         import re
 
         t = self.clock.get_time()
+
+        # ── Optimization: skip LLM if nothing to do ──
+        if t.slot > 1:
+            has_new = self.dm.has_new_contact_messages()
+            pending = self.dm.has_pending_activities()
+            if not has_new and not pending:
+                self.logger.info(
+                    f"[CONTACT][year={t.year} week={t.week} slot={t.slot}] "
+                    f"no new messages, skipping"
+                )
+                return
+
         self.logger.info(
             f"[CONTACT][year={t.year} week={t.week} contact slot={t.slot}] "
         )
@@ -914,6 +942,9 @@ class RoleAgent:
     def receive_in_activity(self, content: str) -> None:
         """Append an observation block into the per-activity context."""
 
+        if self.activity_context is None:
+            # 如果 activity_context 尚未初始化（如 F3 声明阶段 solo NPC），自动创建
+            self.activity_context = []
         if self.activity_context and self.activity_context[-1]["role"] == "user":
             self.activity_context[-1]["content"] += "\n\n" + content
         else:
@@ -1147,8 +1178,8 @@ class RoleAgent:
     def _parse_role_actions(
         self, text: str
     ) -> Tuple[List[Dict[str, object]], Dict[str, str]]:
-        """Extract <role_action> blocks and parse into [{act,type,args}], with errs."""
-        import re
+        """Extract [ACTION_JSON] blocks and parse into [{act,type,args}], with errs."""
+        import json as _json
 
         from src.utils import extract_role_action_blocks
 
@@ -1157,19 +1188,16 @@ class RoleAgent:
         blocks = extract_role_action_blocks(text)
         for blk in blocks:
             s = blk.strip()
-            m = re.match(r"\s*(\w+)\s*\(\s*(.*)\s*\)\s*\Z", s, flags=re.DOTALL)
-            if not m:
-                errs[s] = "unparsable role_action block"
-                continue
-            act = m.group(0)
-            act_type = m.group(1).lower()
-            args_raw = m.group(2)
             try:
-                args = parse_kv_args(args_raw)
-            except Exception as e:
-                errs[act] = f"bad args for action: {e}"
+                data = _json.loads(s)
+            except (_json.JSONDecodeError, ValueError):
+                errs[s[:80]] = "unparsable JSON action block"
                 continue
-            items.append({"act": act, "type": act_type, "args": args})
+            if not isinstance(data, dict) or "type" not in data:
+                errs[s[:80]] = "JSON block missing 'type' field"
+                continue
+            act_type = str(data.pop("type")).lower()
+            items.append({"act": s, "type": act_type, "args": data})
         return items, errs
 
     def _handle_contact_action(
@@ -1702,16 +1730,13 @@ class RoleAgent:
     # =========================================================================
 
     def judge_others(self) -> "SocialRanking":
-        """Generate social ranking for this agent via LLM.
+        """Generate social ranking via LLM, guided by scratchpad delta history.
 
-        This is a PRIVATE evaluation where the agent ranks other people
-        they know based on affection and respect.
+        Scratchpad affection_delta / respect_delta are injected as data points
+        to ground the LLM's subjective judgment — not to replace it.
 
         Returns:
             SocialRanking data for this agent
-
-        Raises:
-            RuntimeError: If parsing fails
         """
         from src.agents.prompts import build_social_ranking_prompt
         from src.agents.response_validator import ValidationResult
@@ -1720,35 +1745,28 @@ class RoleAgent:
 
         verify_logger = get_verify_logger(feature="reward")
 
+        t_str = str(self.clock.get_time())
+
         max_related = self.config["world"]["reward"]["max_related_for_ranking"]
         known_names = self.dm.get_top_related_names(limit=max_related)
 
-        if verify_logger:
-            verify_logger.info(
-                f"[VERIFY-REWARD] {self.name} judge_others: known_names={known_names}"
+        if not known_names:
+            return SocialRanking(
+                agent_name=self.name, time=t_str,
+                affection_scores={}, respect_scores={},
             )
 
-        if not known_names:
-            # No one to rank - legitimate case for new agent
-            if verify_logger:
-                verify_logger.info(
-                    f"[VERIFY-REWARD] {self.name} judge_others: no known people, "
-                    f"returning empty ranking"
-                )
-            return SocialRanking(
-                agent_name=self.name,
-                time=str(self.clock.get_time()),
-                affection_scores={},
-                respect_scores={},
-            )
+        # Build delta summary from scratchpad
+        delta_summary = self._build_delta_summary(known_names)
+        recent_interactions = self.dm.read_known_people_notes(known_names)
 
         messages = self.dm.roleplay_prompt() + build_social_ranking_prompt(
             agent_name=self.name,
             known_names=known_names,
-            recent_interactions=self.dm.read_known_people_notes(known_names),
+            recent_interactions=recent_interactions,
+            delta_summary=delta_summary,
         )
 
-        # Closure wrapper for format_validator
         known_names_set = set(known_names)
 
         def ranking_validator(text: str) -> ValidationResult:
@@ -1756,14 +1774,11 @@ class RoleAgent:
             if data is None:
                 return ValidationResult(
                     passed=False,
-                    feedback="Failed to parse ranking JSON. Expected format: "
-                    '{"affection": {"name": score, ...}, "respect": {"name": score, ...}}',
+                    feedback="Failed to parse ranking JSON.",
                     check_type="format",
                 )
             return ValidationResult(passed=True, feedback="", check_type="format")
 
-        # Generate with god_model: social metrics should always be judged by
-        # the same fair, consistent model regardless of which role_model is used.
         outputs = self._generate_with_functions(
             messages,
             save_to_week_response=False,
@@ -1774,30 +1789,45 @@ class RoleAgent:
         response = outputs[-1]["content"]
 
         save_feature_generation(
-            messages=messages,
-            output=response,
-            feature="social_ranking",
-            extra={"agent": self.name},
+            messages=messages, output=response,
+            feature="social_ranking", extra={"agent": self.name},
         )
 
-        # Parse response (validator already ensured format is valid)
         data = _validate_ranking_response(response, known_names=known_names_set)
-
         if data is None:
-            error_msg = f"Failed to parse social ranking for {self.name}"
-            ERROR_LOGGER.error(error_msg)
-            raise RuntimeError(error_msg)
-
-        if verify_logger:
-            verify_logger.info(
-                f"[VERIFY-REWARD] {self.name} judge_others OUTPUT: "
-                f"affection_scores={data['affection_scores']}, "
-                f"respect_scores={data['respect_scores']}"
+            return SocialRanking(
+                agent_name=self.name, time=t_str,
+                affection_scores={}, respect_scores={},
             )
 
         return SocialRanking(
-            agent_name=self.name,
-            time=str(self.clock.get_time()),
+            agent_name=self.name, time=t_str,
             affection_scores=data["affection_scores"],
             respect_scores=data["respect_scores"],
         )
+
+    def _build_delta_summary(self, known_names: List[str]) -> str:
+        """Read scratchpad deltas and format as a summary string for the LLM prompt.
+
+        Returns an empty string if no scratchpad data exists for any known person.
+        """
+        lines: List[str] = []
+        for target in sorted(known_names):
+            sp_path = self.dm.character_scratchpads / f"{target}.jsonl"
+            if not sp_path.exists():
+                continue
+            entries = self.dm._read_jsonl(sp_path, max_lines=9999)
+            aff = sum(e.get("affection_delta", 0) for e in entries
+                      if "affection_delta" in e)
+            resp = sum(e.get("respect_delta", 0) for e in entries
+                       if "respect_delta" in e)
+            if aff == 0 and resp == 0:
+                continue
+            recent = entries[-1].get("content", "") if entries else ""
+            from src.utils import affection_label
+            label = affection_label(aff, resp)
+            lines.append(
+                f"  {target}: affection {aff:+d}, respect {resp:+d} — {label}"
+                f"{' (' + recent + ')' if recent else ''}"
+            )
+        return "\n".join(lines) if lines else ""

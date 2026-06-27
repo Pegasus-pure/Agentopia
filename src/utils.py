@@ -1718,6 +1718,40 @@ def clip_str(s: str, max_len: int = 500) -> str:
         return s
 
 
+def affection_label(aff: int, resp: int) -> str:
+    """Map (affection, respect) delta totals to a human-readable relationship label.
+
+    Based on SCM (Stereotype Content Model) warmth × competence axes,
+    extended to 3×3=9 labels with buffer zones for smoother transitions.
+
+          respect ≥10    -5~9      ≤-5
+    aff≥10  亲近信赖      宠爱/照顾   喜欢但看不上
+    -9~9    仰慕/敬重     路人/无感   不屑/轻视
+    aff≤-10 畏惧/忌惮     冷淡/疏远   反感/鄙视
+    """
+    if aff >= 10:
+        if resp >= 10:
+            return "亲近信赖"
+        elif resp <= -5:
+            return "喜欢但看不上"
+        else:
+            return "宠爱/照顾"
+    elif aff <= -10:
+        if resp >= 10:
+            return "畏惧/忌惮"
+        elif resp <= -5:
+            return "反感/鄙视"
+        else:
+            return "冷淡/疏远"
+    else:
+        if resp >= 10:
+            return "仰慕/敬重"
+        elif resp <= -5:
+            return "不屑/轻视"
+        else:
+            return "路人/无感"
+
+
 def clip_function_context(messages: List[dict]) -> List[dict]:
     """Condense function-call arguments and tool responses.
 
@@ -3097,25 +3131,37 @@ def update_persona_mbti_in_simulation(persona_data, new_mbti_values):
 
 
 def extract_role_action_blocks(text: str) -> List[str]:
-    """Extract all <role_action>...</role_action> blocks from text.
-
-    Supports:
-    - Whitespace in tags: < role_action>, <role_action >, < /role_action>, etc.
-    - Case-insensitive matching: <ROLE_ACTION>, <Role_Action>, etc.
+    """Extract all [ACTION_JSON]...[/ACTION_JSON] blocks from LLM output.
 
     Args:
-        text: Input text containing role_action blocks
+        text: Input text containing action blocks
 
     Returns:
-        List of block contents (without the tags)
+        List of JSON strings (one per action)
     """
     import re
+    import json as _json
 
-    return re.findall(
-        r"<\s*role_action\s*>(.*?)<\s*/\s*role_action\s*>",
+    blocks = re.findall(
+        r"\[ACTION_JSON\]\s*(.*?)\s*\[/ACTION_JSON\]",
         text,
-        flags=re.DOTALL | re.IGNORECASE,
+        flags=re.DOTALL,
     )
+    valid: List[str] = []
+    for blk in blocks:
+        blk = blk.strip()
+        try:
+            data = _json.loads(blk)
+        except (_json.JSONDecodeError, ValueError):
+            logger.warning(f"[ACTION_JSON] Malformed JSON discarded: {blk[:120]}...")
+            continue
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    valid.append(_json.dumps(item, ensure_ascii=False))
+        elif isinstance(data, dict):
+            valid.append(_json.dumps(data, ensure_ascii=False))
+    return valid
 
 
 def parse_kv_args(s: str) -> Dict[str, object]:

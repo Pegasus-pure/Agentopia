@@ -395,6 +395,10 @@ class ValidationLoopResult:
     validation_records: List[ValidationRecord]  # intermediate process records
 
 
+# NOTE: 此模块的 retry(518行) 和 rebuild_context(349行) 均硬编码 functions=[]，
+# 原因是模块先于 scratchpad 等工具系统存在，后期未同步更新。
+# 若启用 response_validation，重试时 NPC 无法调用工具（read/write scratchpad）。
+# 修复方向：run_validation_loop 新增 functions 参数，调用方 _generate_with_functions 传入 funcs。
 def run_validation_loop(
     format_validator: callable,
     final_answer: str,

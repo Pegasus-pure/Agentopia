@@ -6,6 +6,9 @@ detection (public-location-only grouping with configurable limits).
 
 from __future__ import annotations
 
+import random
+
+
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -141,14 +144,30 @@ class WorldState:
             # Skip private homes
             if location.startswith("home/"):
                 continue
-            if len(names) >= 2:
-                groups.append(
-                    EncounterGroup(
-                        location=location,
-                        phase=self._phase,
-                        agent_names=sorted(names),
+            if len(names) < 2:
+                continue
+            # Randomly split into groups of 1-4; only ≥2 trigger encounters
+            pool = list(names)
+            random.shuffle(pool)
+            while pool:
+                max_size = min(4, len(pool))
+                possible_sizes = list(range(1, max_size + 1))
+                # Weight: favours pairs (2) and trios (3) over solo/quad
+                weights = [
+                    1 if s == 1 else (5 if s == 2 else (3 if s == 3 else 1))
+                    for s in possible_sizes
+                ]
+                size = random.choices(possible_sizes, weights=weights, k=1)[0]
+                chunk = sorted(pool[:size])
+                pool = pool[size:]
+                if len(chunk) >= 2:
+                    groups.append(
+                        EncounterGroup(
+                            location=location,
+                            phase=self._phase,
+                            agent_names=chunk,
+                        )
                     )
-                )
 
         # Sort by group size descending, then by location for determinism
         groups.sort(key=lambda g: (-len(g.agent_names), g.location))

@@ -1,86 +1,58 @@
 # Agentopia (Extended Fork)
 
-This fork contains several extensions built on top of [Agentopia](https://github.com/Neph0s/Agentopia) by [@Pegasus-pure](https://github.com/Pegasus-pure). See the **What's New** section below for details.
-
-> [!NOTE]
-> For the original project description, documentation, and setup instructions, please see:
-> - [English](docs/README_en.md)
-> - [简体中文](docs/README_zh.md) | [日本語](docs/README_ja.md) | [한국어](docs/README_ko.md)
+基于 [Agentopia](https://github.com/Neph0s/Agentopia) 深度扩展的 NPC 社会模拟引擎。原项目描述见 `docs/README_*.md`。
 
 ---
 
-## What's New
+## 架构对比
 
-### 1. Player as the 101st Agent (Implemented)
-
-The player joins as a normal NPC. The only difference: the input source is replaced from LLM API to terminal `stdin` via **dependency injection** — the core scheduler is not modified.
-
-- Scheduler calls an abstract input interface (LLM for NPCs, stdin for player)
-- Player reuses existing event types: `Solo`, `Joint`, `Public`
-- Simulation runs asynchronously; only pauses when player input is required
-
-**Value:** Introduces a "human variable" into the agent society without architectural changes.
-
----
-
-### 2. Time Granularity: 5×5 Phase Plan (Implemented)
-
-Motivation: The original `weekly_diary` produces only 5 records/week, too coarse for observing micro-emergent behaviors.
-
-Changes:
-- PLAN stage: Agents generate a **5 days × 5 phases** plan (25 items) in one shot
-- ACTIVITY stage: Each day executes 5 phases, mapped to plan items
-- REVIEW stage: 25 records/week instead of 5 (same logic, higher density)
-
-Memory: Long-term preserved; short-term context reads latest 25 records (~1 week).
-
-**Value:** Micro-emergence becomes observable and meaningful.
+| 维度 | 原项目 | 本项目 |
+|------|--------|--------|
+| 时间粒度 | 5天/周，无日内细分 | 5天 × 5时段，25 phase/周 |
+| 偶遇系统 | God Model 全局分配 | WorldState 实时位置追踪，同地点碰撞触发 |
+| 偶遇后处理 | 无 | 信息传播 + 情感追踪 + 跟随行为 |
+| NPC 记忆 | 单次快照 | scratchpad 读写（目标/感知/记忆）+ 年度档案 |
+| Player 交互 | 无 | 终端 UI 层（PLAN/CONTACT/Signup/Settle） |
+| 数据分析 | 原始 28 指标 | 适配版 + encounter/follow 指标 + 排除 Player |
 
 ---
 
-### 3. Encounter System Refactor (Implemented, Feedback Logic WIP)
+## 核心系统
 
-The original system-driven `Encounter` event (Stage 4) is replaced with a **state-driven** approach:
+### 周循环
 
-- Trigger: Two agents both `Solo` + same location → auto `Contact`
-- Emergence: Conversation outcome **feeds back into the original plan** — plans are mutable
+```
+PLAN → Signup → CONTACT(×5槽) → ACTIVITY(×5天×5时段) → Review → Settle
+```
 
-The plan-feedback logic is implemented; tuning the degree of plan change via a Reward-style mechanism is planned.
+CONTACT 阶段 NPC 主动联络、邀请活动。ACTIVITY 阶段按计划执行 solo/joint/public 活动，同地点 ≥2 人自动触发偶遇对话。
 
-**Value:** Enables "a conversation can change your trajectory" as a genuine emergent behavior, not a scripted event.
+### 偶遇 (WorldState + EncounterPipeline)
 
----
+- WorldState 实时追踪每个 NPC 的位置
+- 同地点碰撞 → 自动偶遇 → 多轮 LLM 对话（动态终结）
+- 偶遇后自动：信息传播（rumour）+ 情感追踪（好感变化）+ 跟随（改计划去同一地点）
 
-### 4. Dynamic Dialogue Termination (Implemented)
+### 数据分析
 
-Problem: Fixed 20-turn dialogue is too expensive and unnatural under diary-mode density (25 events/week).
+```bash
+python scripts/compute_metrics.py --data-dir <run_id>
+```
 
-Solution:
-1. Compress max turns to **8** (60% cost reduction)
-2. LLM detects termination per turn: transition words ("but", "never mind") + topic drift → natural end; farewell words → early exit
-3. Real-time confidence update on early termination → affects next planning cycle immediately
+可分析维度：
+- 情感变化 — mood/material/social/esteem 四维满足感时序
+- 社交关系 — 主动/被动联络次数、自我中心网络
+- 活动分布 — 各地点热度、活动类型占比
+- 经济状态 — 存款变化、消费金额、额外收入
+- Token 消耗 — 按周/按 agent 的 LLM 调用成本
 
-**Value:** Dialogue feels natural ("end when there's nothing left to say"), not mechanical.
-
----
-
-### 5. Interest-Based Confidence Adjustment (Planned)
-
-Inspired by the Reward mechanism:
-- Topic-personality matchmaking factors into confidence adjustment
-- Gradient decay prevents abrupt personality flips
-
-Currently in design phase.
+输出 `analysis/<run_id>/metrics.json`，按周+按年两层聚合。
 
 ---
 
-## Architectural Notes
+## Player 状态
 
-All extensions are **non-intrusive**:
-- No core scheduler rewrite
-- Dependency injection pattern for player input
-- Original event types reused wherever possible
-- Backward compatible with the original 8-stage weekly design
+Player 系统已部分实现（终端交互、PLAN/CONTACT/Signup/Settle），当前 **暂停开发**，聚焦 NPC 社群完善后再回来做。
 
 ---
 

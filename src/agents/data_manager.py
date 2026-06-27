@@ -155,6 +155,16 @@ class DataManager:
         self.last_slot_errors = ""
         self.location_store = get_location_store(self.world)
 
+        # Memory config — driven by config.json world.memory
+        mem_cfg = config.get("world", {}).get("memory", {})
+        self.retrieval_limit = mem_cfg.get("retrieval_limit", 5)
+        self.time_decay_halflife = mem_cfg.get("time_decay_halflife_weeks", 4)
+        self.compress_threshold = mem_cfg.get("compress_threshold", 50)
+        self.compress_keep_recent = mem_cfg.get("compress_keep_recent", 10)
+        self.scoring_weights = mem_cfg.get("scoring_weights", {
+            "keyword_match": 0.6, "time_decay": 0.3, "summary_bonus": 0.1
+        })
+
     def set_last_slot_errors(self, s: str) -> None:
         """Record the previous round's action error text, for display in the next contact_prompt."""
         self.last_slot_errors = str(s or "")
@@ -978,6 +988,71 @@ class DataManager:
 
         return results
 
+    def get_fulfillment_history_daily(self, n_days: int) -> List[Dict[str, Any]]:
+        """Get fulfillment snapshots for the last N days.
+
+        Used for daily subjective reward calculation.
+        Reads from state.jsonl, filters for activity records, groups by day.
+
+        Args:
+            n_days: Number of days to include.
+                    Returns N-1 historical days + current state.
+
+        Returns:
+            List of dicts, each containing:
+            - time: str (e.g., "Y2020-W01-activity-D3-P{night}")
+            - fulfillment: Dict[str, int] (mood, material, social, esteem)
+            - vitality: int
+            Sorted from oldest to newest.
+        """
+        state_path = self.root / "state.jsonl"
+        if not state_path.exists():
+            return []
+
+        import re
+        from collections import defaultdict
+
+        # Read all state records, filter for activity phases
+        records = []
+        with open(state_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                t = rec.get("time", "")
+                # Only include activity records (not begin/settle)
+                if "activity" in t and "settle" not in t:
+                    records.append(rec)
+
+        if not records:
+            return []
+
+        # Group by day, take last record of each day (night phase = end of day)
+        day_records = defaultdict(list)
+        for rec in records:
+            t = rec["time"]
+            m = re.search(r"D(\d+)", t)
+            if m:
+                day = int(m.group(1))
+                day_records[day].append(rec)
+
+        # Sort days, take last n_days
+        sorted_days = sorted(day_records.keys())
+        target_days = sorted_days[-n_days:] if len(sorted_days) >= n_days else sorted_days
+
+        results = []
+        for day in target_days:
+            # Take last record of the day (night phase)
+            rec = day_records[day][-1]
+            results.append({
+                "time": rec["time"],
+                "fulfillment": rec["content"]["fulfillment"],
+                "vitality": rec["content"]["vitality"],
+            })
+
+        return results
+
     def apply_fulfillment_decay(self, decays: Dict[str, int]) -> None:
         """Apply decay values to current fulfillment.
 
@@ -1164,6 +1239,34 @@ class DataManager:
 
         prompt = "\n\n".join([h.strip() for h in parts if h.strip() != ""])
 
+        # ── F2: PLAN 阶段 rumor 注入 ──
+        rumor_block = self.get_rumor_injection_block(query="本周计划")
+        if rumor_block:
+            prompt += rumor_block
+
+        # ── P203: PLAN 阶段情感注入 ──
+        prompt += self._build_affection_block()
+
+        # ── P203: PLAN 选址指引 + 常去地点 ──
+        loc_hints = self._build_location_hints()
+        if loc_hints:
+            prompt += (
+                "\n\n## Frequent Encounter Locations\n"
+                "These are places where you've recently encountered each person:\n"
+                + loc_hints +
+                "\n\n## Weekly Planning Guidance\n"
+                "When choosing locations for your solo activities:\n"
+                "- Go where people you like often visit — you might run into them.\n"
+                "- Avoid places frequented by people you dislike.\n"
+                "- Keep it natural — your schedule should still make sense for you."
+            )
+        else:
+            prompt += (
+                "\n\n## Weekly Planning Guidance\n"
+                "Your feelings about others may subtly influence where you choose to go.\n"
+                "You might gravitate toward places where people you like can be found."
+            )
+
         return [{"role": "user", "content": prompt}]
 
     def signup_prompt(self, events_list: str) -> List[Dict[str, str]]:
@@ -1181,7 +1284,135 @@ class DataManager:
 
         prompt = "\n\n".join([h.strip() for h in parts if h.strip() != ""])
 
+        # ── P203 #7: Public 签到情感注入 ──
+        prompt += self._build_affection_block()
+
         return [{"role": "user", "content": prompt}]
+
+    # ── P203: Shared affection block builder ──────────────────────────
+
+    def _build_affection_block(self) -> str:
+        """Read scratchpad deltas and format a 'Your Feelings Towards Others' block.
+
+        Used by contact_prompt, plan_prompt, and activity_prompt (joint).
+        Returns empty string if no scratchpad data exists.
+        """
+        try:
+            char_dir = self.character_scratchpads
+            if not char_dir.exists():
+                return ""
+            aff_lines = []
+            for sp_file in sorted(char_dir.iterdir()):
+                if not sp_file.suffix == ".jsonl":
+                    continue
+                target = sp_file.stem
+                entries = self._read_jsonl(sp_file, max_lines=8)
+                aff_deltas = [e.get("affection_delta", 0) for e in entries
+                              if "affection_delta" in e]
+                resp_deltas = [e.get("respect_delta", 0) for e in entries
+                               if "respect_delta" in e]
+                if not aff_deltas and not resp_deltas:
+                    continue
+                aff_total = sum(aff_deltas)
+                resp_total = sum(resp_deltas)
+                recent = entries[-1].get("content", "") if entries else ""
+
+                from src.utils import affection_label
+                label = affection_label(aff_total, resp_total)
+
+                aff_lines.append(
+                    f"  {target}: aff={'+' if aff_total >= 0 else ''}{aff_total}"
+                    f" resp={'+' if resp_total >= 0 else ''}{resp_total}"
+                    f" — {label}"
+                    f"{' (' + recent + ')' if recent else ''}"
+                )
+            if aff_lines:
+                return (
+                    "\n\n## Your Feelings Towards Others (aff=liking, resp=respect)\n"
+                    + "\n".join(aff_lines)
+                )
+            return ""
+        except Exception:
+            return ""
+
+    def _build_location_hints(self) -> str:
+        """Read encounter_event entries and extract frequent encounter locations per person.
+
+        Returns formatted lines like "  刘世刚: recently at library, gym, cafeteria",
+        or empty string if no encounter data.
+        """
+        try:
+            char_dir = self.character_scratchpads
+            if not char_dir.exists():
+                return ""
+            import re
+            re_loc = re.compile(r"at (\w+)")
+            hints = []
+            for sp_file in sorted(char_dir.iterdir()):
+                if not sp_file.suffix == ".jsonl":
+                    continue
+                target = sp_file.stem
+                entries = self._read_jsonl(sp_file, max_lines=30)
+                locs: list[str] = []
+                for e in entries:
+                    if e.get("encounter_event"):
+                        match = re_loc.search(e.get("content", ""))
+                        if match:
+                            locs.append(match.group(1))
+                if locs:
+                    seen: set[str] = set()
+                    unique = []
+                    for loc in locs:
+                        if loc not in seen:
+                            seen.add(loc)
+                            unique.append(loc)
+                            if len(unique) >= 3:
+                                break
+                    hints.append(f"  {target}: recently at {', '.join(unique)}")
+            if hints:
+                return "\n".join(hints)
+            return ""
+        except Exception:
+            return ""
+
+    def apply_affection_decay(self, decay_factor: float = 0.95) -> int:
+        """Apply yearly decay to all affection/respect deltas in scratchpad.
+
+        Multiplies every delta by *decay_factor*, rounds to int.
+        Does NOT delete zero-delta entries (preserves content history).
+
+        Returns:
+            Number of scratchpad files touched.
+        """
+        try:
+            char_dir = self.character_scratchpads
+            if not char_dir.exists():
+                return 0
+            import json
+            touched = 0
+            for sp_file in char_dir.iterdir():
+                if not sp_file.suffix == ".jsonl":
+                    continue
+                entries = self._read_jsonl(sp_file, max_lines=9999)
+                modified = False
+                for e in entries:
+                    for key in ("affection_delta", "respect_delta"):
+                        if key in e and e[key] != 0:
+                            new_val = int(e[key] * decay_factor)
+                            if new_val != e[key]:
+                                e[key] = new_val
+                                modified = True
+                if modified:
+                    sp_file.write_text(
+                        "\n".join(
+                            json.dumps(e, ensure_ascii=False) for e in entries
+                        ) + "\n",
+                        encoding="utf-8",
+                    )
+                    touched += 1
+            return touched
+        except Exception:
+            return 0
 
     def contact_prompt(self) -> List[Dict[str, str]]:
         """Build the per-contact-phase prompt with concrete time window tips.
@@ -1227,8 +1458,59 @@ class DataManager:
         ]
 
         prompt = "\n\n".join([h.strip() for h in parts if h.strip() != ""])
+        aff_block = self._build_affection_block()
+        prompt += aff_block
+
+        # ── P203: CONTACT 邀约态度指引（情感决定行为）──
+        prompt += (
+            "\n\n## Invitation & Response Guidelines\n"
+            "Use your feelings above to decide how to handle invitations:\n"
+            "- You are NOT obligated to accept every invitation.\n"
+            "- If you dislike the inviter (low affection), you may politely decline or ignore.\n"
+            "- If you respect the inviter despite disliking them (high respect, low affection), "
+            "you may feel pressured to accept — but your tone may be cold or formal.\n"
+            "- If you like the inviter (high affection), accept warmly.\n"
+            "- Reciprocity is expected: if someone rejected you or treated you poorly, "
+            "you are less likely to accept their future invitations.\n"
+            "- Accepting an invitation from someone you dislike may deepen your resentment "
+            "(negative affection grows).\n"
+            "- You may send gifts to people you like or admire, especially on special occasions."
+        )
 
         return [{"role": "user", "content": prompt}]
+
+    def has_new_contact_messages(self) -> bool:
+        """Check if there are any unread messages in the current slot."""
+        t = self.clock.get_time()
+        try:
+            sig_path = self.contact / "sig.jsonl"
+            if not sig_path.exists():
+                return False
+            entries = self._read_jsonl(sig_path, max_lines=5)
+            for e in entries:
+                if str(e.get("time", "")).startswith(str(t)):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def has_pending_activities(self) -> bool:
+        """Check if there are pending invite responses or proposals in current week."""
+        try:
+            t_str = str(self.clock.get_time())
+            week_prefix = t_str[:6] if len(t_str) > 6 else t_str
+            for f in self.contact.iterdir():
+                if f.name == "sig.jsonl":
+                    continue
+                if f.suffix == ".jsonl" and f.stat().st_size > 0:
+                    entries = self._read_jsonl(f, max_lines=1)
+                    if entries:
+                        e_time = str(entries[-1].get("time", ""))
+                        if e_time[:6] == week_prefix:
+                            return True
+        except Exception:
+            pass
+        return False
 
     def finalize_contact_prompt(
         self, scheduling_results_str: str
@@ -1363,6 +1645,24 @@ class DataManager:
 
         prompt = "\n\n".join([h.strip() for h in parts if h.strip() != ""])
 
+        # ── P203: ACTIVITY 阶段情感注入（joint / public）──
+        if activity_type in ("joint", "public"):
+            aff_block = self._build_affection_block()
+            prompt += aff_block
+            # ── 偶遇态度指引（joint 有情感数据时）──
+            if activity_type == "joint" and aff_block:
+                prompt += (
+                    "\n\n## Encounter Attitude\n"
+                    "Based on your feelings above, you may choose how to interact:\n"
+                    "- Greet warmly and engage enthusiastically (high affection)\n"
+                    "- Exchange pleasantries briefly, then focus on your own activity (neutral)\n"
+                    "- Stay distant or pretend not to notice them (low affection)\n"
+                    "- Be cold, sarcastic, or confrontational (strongly negative affection)\n"
+                    "- You may give gifts to people you feel warmly towards.\n"
+                    "You are NOT forced to have a full conversation. Your attitude "
+                    "should honestly reflect your feelings."
+                )
+
         return [{"role": "user", "content": prompt}]
 
     def review_prompt(self) -> List[Dict[str, str]]:
@@ -1374,7 +1674,42 @@ class DataManager:
         ]
 
         prompt = "\n\n".join([h.strip() for h in parts if h.strip() != ""])
+
+        # ── P203: REVIEW 注入本周 encounter 摘要 ──
+        encounter_summaries = self._build_encounter_summary_block()
+        if encounter_summaries:
+            prompt += encounter_summaries
+
+        # ── P203 #9: REVIEW 注入本周 rumor ──
+        rumor_block = self.get_rumor_injection_block(query="本周回顾")
+        if rumor_block:
+            prompt += rumor_block
+
         return [{"role": "user", "content": prompt}]
+
+    def _build_encounter_summary_block(self) -> str:
+        """Read encounter_event entries from all scratchpad files and format summaries.
+
+        Returns empty string if no encounters recorded.
+        """
+        try:
+            char_dir = self.character_scratchpads
+            if not char_dir.exists():
+                return ""
+            summaries = []
+            for sp_file in sorted(char_dir.iterdir()):
+                if not sp_file.suffix == ".jsonl":
+                    continue
+                target = sp_file.stem
+                entries = self._read_jsonl(sp_file, max_lines=50)
+                for e in entries:
+                    if e.get("encounter_event"):
+                        summaries.append(f"  With {target}: {e['content']}")
+            if summaries:
+                return "\n\n## Your Encounters This Week\n" + "\n".join(summaries)
+            return ""
+        except Exception:
+            return ""
 
     def settle_prompt(self, discard_count: int, max_items: int) -> List[Dict[str, str]]:
         """Build the settle-phase prompt for weekly cleanup.
@@ -1845,6 +2180,177 @@ class DataManager:
             self.pad_last_access_map[pad_rel] = self.clock.get_time()
 
             return f"SUCCESS: Content of {name}:\n{content}"
+
+    def _score_entry(self, entry: Dict, query: str) -> float:
+        """Score a single scratchpad entry against a query (0~1).
+
+        Combines three weighted signals defined in world.memory.scoring_weights:
+          1. keyword_match — token overlap between query and entry content
+          2. time_decay    — exponential decay based on entry age (weeks)
+          3. summary_bonus — bonus for entries that have a substantive summary
+        """
+        scores = self.scoring_weights
+
+        content = entry.get("content", "")
+        time_str = entry.get("time", "")
+
+        # 1. Token overlap (keyword match)
+        keyword_score = 0.0
+        if query:
+            query_tokens = set(query.lower().split())
+            content_tokens = set(content.lower().split())
+            if query_tokens:
+                overlap = len(query_tokens & content_tokens) / len(query_tokens)
+                keyword_score = min(1.0, overlap)
+
+        # 2. Exponential time decay
+        current_ts = self.clock.get_time()
+        current_week = current_ts.year * 52 + current_ts.week
+        try:
+            entry_ts = TimeState.from_string(time_str)
+            entry_week = entry_ts.year * 52 + entry_ts.week
+        except Exception:
+            entry_week = current_week
+
+        age_weeks = max(0, current_week - entry_week)
+        halflife = self.time_decay_halflife
+        decay = 0.5 ** (age_weeks / halflife) if halflife > 0 else 1.0
+
+        # 3. Summary bonus
+        summary = entry.get("summary", "")
+        summary_bonus = 1.0 if len(summary) >= 10 else 0.0
+
+        # Weighted combination
+        total = (
+            scores["keyword_match"] * keyword_score +
+            scores["time_decay"] * decay +
+            scores["summary_bonus"] * summary_bonus
+        )
+        return min(1.0, max(0.0, total))
+
+    def read_scratchpad_retrieved(
+        self,
+        s_name: str,
+        query: str = "",
+        limit: int = 5,
+        time_range: Optional[Tuple[int, int]] = None,
+    ) -> List[str]:
+        """Retrieve scratchpad entries ranked by relevance to *query*.
+
+        When *query* is empty the entries are ranked purely by time decay
+        (most recent first — "what happened recently?").
+
+        *time_range* is an optional (start_week, end_week) tuple using
+        normalized week numbers (year * 52 + week).  Entries whose timestamp
+        falls outside this range are silently skipped.
+
+        Returns up to *limit* content strings, ordered by descending score.
+        """
+        # --- Name validation (same logic as read_scratchpad) ---
+        raw = s_name.strip()
+        lower = raw.lower()
+        if lower.endswith(".txt"):
+            name = raw[:-4]
+        elif lower.endswith(".jsonl"):
+            name = raw[:-6]
+        else:
+            name = raw
+
+        if name == "general":
+            path = self.general_scratchpad
+        elif name == "working_memory":
+            path = self.working_memory
+        elif name.startswith("characters/") or name.startswith("others/"):
+            path = (self.scratch / name).with_suffix(".jsonl")
+        else:
+            return []
+
+        if not path.exists():
+            return []
+
+        # --- Read all entries, filter by time_range, score, sort ---
+        entries = self._read_jsonl(path, max_lines=None)
+        if not entries:
+            return []
+
+        # Time-range filtering
+        if time_range is not None:
+            start_week, end_week = time_range
+            filtered: List[Dict] = []
+            for e in entries:
+                time_str = e.get("time", "")
+                if not time_str:
+                    continue
+                try:
+                    ts = TimeState.from_string(time_str)
+                    entry_week = ts.year * 52 + ts.week
+                except Exception:
+                    continue
+                if start_week <= entry_week <= end_week:
+                    filtered.append(e)
+            entries = filtered
+
+        scored = [(self._score_entry(e, query), e.get("content", "")) for e in entries]
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+
+        return [content for _, content in scored[: limit]]
+
+    def compress_scratchpad(
+        self,
+        s_name: str,
+        keep_recent: int = 10,
+        summarize_older: bool = True,
+    ) -> str:
+        """Compress a scratchpad by summarising older entries.
+
+        Follows an append-only principle — old entries are *never* deleted.
+        When the total entry count ≤ *keep_recent*, returns an empty string
+        (no compression needed).
+
+        Otherwise the most recent *keep_recent* entries are preserved intact
+        and all older entries are concatenated.  Depending on *summarize_older*:
+
+        - ``True``  → returns a prompt fragment for the LLM to summarise
+        - ``False`` → returns the raw concatenated text of the older entries
+        """
+        # --- Name validation (same logic as read_scratchpad) ---
+        raw = s_name.strip()
+        lower = raw.lower()
+        if lower.endswith(".txt"):
+            name = raw[:-4]
+        elif lower.endswith(".jsonl"):
+            name = raw[:-6]
+        else:
+            name = raw
+
+        if name == "general":
+            path = self.general_scratchpad
+        elif name == "working_memory":
+            path = self.working_memory
+        elif name.startswith("characters/") or name.startswith("others/"):
+            path = (self.scratch / name).with_suffix(".jsonl")
+        else:
+            return ""
+
+        if not path.exists():
+            return ""
+
+        entries = self._read_jsonl(path, max_lines=None)
+        if not entries or len(entries) <= keep_recent:
+            return ""
+
+        older = entries[: -keep_recent]
+        older_text = "\n\n".join(
+            f"[{e.get('time', '?')}] {e.get('content', '')}" for e in older
+        )
+
+        if summarize_older:
+            return (
+                "Summarize the following memory entries in 2-3 sentences, "
+                "focusing on key events and relationships:\n\n"
+                + older_text
+            )
+        return older_text
 
     def update_scratchpad(
         self,
@@ -2381,8 +2887,7 @@ class DataManager:
         n_weeks = int(config["world"]["contact"]["max_weeks_for_future_schedule"])
         schedule_file = self.root / "schedule.jsonl"
         # exclude_cur_t=False: schedules written in current stage must be visible
-        # (e.g., joint schedules written in AFTER_CONTACT must be readable by
-        # _generate_encounter_events() in the same stage)
+        # (e.g., joint schedules written in AFTER_CONTACT must be readable)
         rows = self._read_jsonl(
             schedule_file, max_weeks=n_weeks + 1, exclude_cur_t=False
         )
@@ -2757,3 +3262,282 @@ class DataManager:
             return None
 
         return float(records[-1]["raw_score"])
+
+    # =========================================================================
+    # F2 Rumor Management
+    # =========================================================================
+
+    RUMOR_DIR = "rumors"
+
+    def _ensure_rumor_dir(self) -> Path:
+        """确保 rumor_pool 目录存在。"""
+        p = self.root
+        _ensure_dir(p)
+        return p
+
+    def _rumor_path(self) -> Path:
+        """返回当前 NPC 的 rumor_pool 文件路径。"""
+        return self.root / "rumor.jsonl"
+
+    def append_rumor(
+        self,
+        content: str,
+        topic: str,
+        source_type: str,
+        *,
+        source_event_id: Optional[str] = None,
+        source_location: Optional[str] = None,
+        parent_rumor_id: Optional[str] = None,
+        fidelity: float = 1.0,
+        spreader: Optional[str] = None,
+        original_source: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+    ) -> str:
+        """追加一条 rumor 到当前 NPC 的 rumor_pool。
+
+        内部调用 _append_jsonl(data/rumors/{name}_rumors.jsonl, entry)。
+        自动生成 rumor_id 和时间戳。
+
+        Returns:
+            rumor_id: 新创建的 rumor ID，失败时返回 ""。
+        """
+        import uuid
+
+        t = str(self.clock.get_time())
+        short_uuid = uuid.uuid4().hex[:8]
+        rumor_id = f"rumor-{t}-{short_uuid}"
+
+        entry = {
+            "rumor_id": rumor_id,
+            "content": content,
+            "topic": topic,
+            "source_type": source_type,
+            "source_event_id": source_event_id,
+            "source_location": source_location,
+            "parent_rumor_id": parent_rumor_id,
+            "fidelity": fidelity,
+            "original_fidelity": fidelity,
+            "spreader": spreader,
+            "original_source": original_source,
+            "tags": tags or [],
+        }
+
+        try:
+            self._append_jsonl(self._rumor_path(), entry)
+            self.logger.debug(f"[Rumor] {self.char} appended rumor: {rumor_id}")
+            return rumor_id
+        except Exception as e:
+            self.logger.warning(
+                f"[Rumor] Failed to append rumor for {self.char}: {e}"
+            )
+            return ""
+
+    def read_rumors_retrieved(
+        self,
+        query: str = "",
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """从 rumor_pool 检索与 query 相关的 rumor 条目。
+
+        复用 _score_entry 的评分逻辑（keyword match + time decay）。
+        自动跳过 fidelity < threshold 的条目（视为已遗忘）。
+
+        Args:
+            query: 检索查询字符串（空 = 按时间衰减排序）。
+            limit: 最大返回条数。
+
+        Returns:
+            每个条目为 {"content": str, "fidelity": float, ...} 的 dict。
+        """
+        cfg = config.get("world", {}).get("rumor", {})
+        threshold = cfg.get("fidelity_threshold", 0.2)
+
+        path = self._rumor_path()
+        if not path.exists():
+            return []
+
+        try:
+            entries = self._read_jsonl(path, max_lines=99999, exclude_cur_t=False)
+        except Exception:
+            return []
+
+        if not entries:
+            return []
+
+        # 过滤已遗忘条目
+        active = [e for e in entries if e.get("fidelity", 1.0) >= threshold]
+        if not active:
+            return []
+
+        # 评分排序
+        scored = [(self._score_entry(e, query), e) for e in active]
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+
+        # 返回 top-k
+        results = []
+        for score, entry in scored[:limit]:
+            results.append({
+                "content": entry.get("content", ""),
+                "fidelity": entry.get("fidelity", 1.0),
+                "topic": entry.get("topic", ""),
+                "time": entry.get("time", ""),
+                "rumor_id": entry.get("rumor_id", ""),
+                "source_type": entry.get("source_type", ""),
+                "source_location": entry.get("source_location", ""),
+                "original_source": entry.get("original_source", ""),
+                "score": score,
+            })
+
+        return results
+
+    def read_rumors_all(
+        self,
+        include_forgotten: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """读取 NPC 的完整 rumor_pool（用于调试/可视化）。
+
+        Args:
+            include_forgotten: 是否包含已遗忘的条目。
+
+        Returns:
+            所有（或未遗忘的）rumor 条目列表。
+        """
+        cfg = config.get("world", {}).get("rumor", {})
+        threshold = cfg.get("fidelity_threshold", 0.2)
+
+        path = self._rumor_path()
+        if not path.exists():
+            return []
+
+        try:
+            entries = self._read_jsonl(path, max_lines=99999, exclude_cur_t=False)
+        except Exception:
+            return []
+
+        if include_forgotten:
+            return entries
+
+        return [e for e in entries if e.get("fidelity", 1.0) >= threshold]
+
+    def compress_rumors(
+        self,
+        keep_recent: int = 20,
+        summarize: bool = True,
+    ) -> str:
+        """压缩 rumor_pool：若条目数超过阈值，丢弃已遗忘条目 + 可选 LLM 总结旧条目。
+
+        类比 compress_scratchpad 的 append-only 模式：
+        已遗忘条目不删除，只是不再参与检索。
+
+        Returns:
+            需要压缩时返回 LLM prompt 片段，否则返回 ""。
+        """
+        path = self._rumor_path()
+        if not path.exists():
+            return ""
+
+        entries = self.read_rumors_all(include_forgotten=True)
+        if len(entries) <= keep_recent:
+            return ""
+
+        # 只保留最近 keep_recent 条 + 未遗忘的旧条目
+        recent = entries[-keep_recent:]
+        older = entries[:-keep_recent]
+
+        # 从 older 中保留未遗忘的
+        cfg = config.get("world", {}).get("rumor", {})
+        threshold = cfg.get("fidelity_threshold", 0.2)
+        older_active = [e for e in older if e.get("fidelity", 1.0) >= threshold]
+
+        # 如果 older_active 没几条，不需要压缩
+        if len(older_active) <= 3:
+            return ""
+
+        if summarize:
+            older_text = "\n\n".join(
+                f"[{e.get('time', '?')}] (fidelity={e.get('fidelity', 1.0):.2f}) "
+                f"{e.get('content', '')}"
+                for e in older_active
+            )
+            return (
+                "Summarize the following older rumors in 2-3 sentences, "
+                "focusing on key events and relationships:\n\n"
+                + older_text
+            )
+
+        return ""
+
+    def _apply_fidelity_decay(self) -> None:
+        """对所有 rumor 条目应用每日 fidelity 衰减。
+
+        在 SETTLE stage 末尾调用。
+        fidelity = max(0.0, fidelity - config.fidelity_decay_per_day)
+        衰减后重写整个 jsonl（因为需要修改已写入的条目）。
+        """
+        cfg = config.get("world", {}).get("rumor", {})
+        decay = cfg.get("fidelity_decay_per_day", 0.05)
+
+        path = self._rumor_path()
+        if not path.exists():
+            return
+
+        try:
+            entries = self._read_jsonl(path, max_lines=99999, exclude_cur_t=False)
+        except Exception:
+            return
+
+        if not entries:
+            return
+
+        changed = False
+        for entry in entries:
+            old_fidelity = entry.get("fidelity", 1.0)
+            if old_fidelity > 0.0:
+                new_fidelity = max(0.0, old_fidelity - decay)
+                if new_fidelity != old_fidelity:
+                    entry["fidelity"] = new_fidelity
+                    changed = True
+
+        if not changed:
+            return
+
+        # 重写整个文件
+        try:
+            _ensure_dir(path.parent)
+            with path.open("w", encoding="utf-8") as f:
+                for entry in entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            self.logger.debug(
+                f"[Rumor] Applied fidelity decay (rate={decay}) for {self.char}"
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"[Rumor] Failed to write decayed rumors for {self.char}: {e}"
+            )
+
+    def get_rumor_injection_block(self, query: str = "") -> str:
+        """获取 rumor 注入文本块（用于 PLAN prompt）。
+
+        从 rumor_pool 检索相关 rumor，格式化为 RUMOR_INJECTION_BLOCK。
+
+        Args:
+            query: 检索查询字符串。
+
+        Returns:
+            格式化的 rumor 注入文本块，无相关 rumor 时返回 ""。
+        """
+        cfg = config.get("world", {}).get("rumor", {})
+        limit = cfg.get("rumor_retrieval_limit", 3)
+
+        rumors = self.read_rumors_retrieved(query=query, limit=limit)
+        if not rumors:
+            return ""
+
+        from src.agents.prompts import RUMOR_INJECTION_BLOCK
+
+        rumor_lines = "\n".join(
+            f"- [fidelity={r.get('fidelity', 1.0):.2f}] {r.get('content', '')}"
+            for r in rumors
+        )
+
+        return "\n\n" + RUMOR_INJECTION_BLOCK.format(rumor_lines=rumor_lines)
