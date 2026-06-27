@@ -1,6 +1,14 @@
 # Agentopia (Extended Fork)
 
+<<<<<<< HEAD
 基于 [Agentopia](https://github.com/Neph0s/Agentopia) 深度扩展的 NPC 社会模拟引擎。原项目描述见 `docs/README_*.md`。
+=======
+This fork contains several extensions built on top of [Agentopia](https://github.com/Neph0s/Agentopia) by [@Pegasus-pure](https://github.com/Pegasus-pure). See the **What's New** section below for details.
+
+> [!NOTE]
+> For the original project description, documentation, and setup instructions, please see:
+> - [English](docs/README_en.md) | [简体中文](docs/README_zh.md) | [日本語](docs/README_ja.md) | [한국어](docs/README_ko.md)
+>>>>>>> 7a911404f31ac1ac10c4971016a4761cd02b94ba
 
 ---
 
