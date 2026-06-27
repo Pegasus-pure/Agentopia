@@ -1,14 +1,10 @@
 # Agentopia (Extended Fork)
 
-<<<<<<< HEAD
-基于 [Agentopia](https://github.com/Neph0s/Agentopia) 深度扩展的 NPC 社会模拟引擎。原项目描述见 `docs/README_*.md`。
-=======
-This fork contains several extensions built on top of [Agentopia](https://github.com/Neph0s/Agentopia) by [@Pegasus-pure](https://github.com/Pegasus-pure). See the **What's New** section below for details.
 
 > [!NOTE]
 > For the original project description, documentation, and setup instructions, please see:
 > - [English](docs/README_en.md) | [简体中文](docs/README_zh.md) | [日本語](docs/README_ja.md) | [한국어](docs/README_ko.md)
->>>>>>> 7a911404f31ac1ac10c4971016a4761cd02b94ba
+
 
 ---
 
@@ -21,7 +17,6 @@ This fork contains several extensions built on top of [Agentopia](https://github
 | 偶遇后处理 | 无 | 信息传播 + 情感追踪 + 跟随行为 |
 | NPC 记忆 | 单次快照 | scratchpad 读写（目标/感知/记忆）+ 年度档案 |
 | Player 交互 | 无 | 终端 UI 层（PLAN/CONTACT/Signup/Settle） |
-| 数据分析 | 原始 28 指标 | 适配版 + encounter/follow 指标 + 排除 Player |
 
 ---
 
@@ -33,7 +28,7 @@ This fork contains several extensions built on top of [Agentopia](https://github
 PLAN → Signup → CONTACT(×5槽) → ACTIVITY(×5天×5时段) → Review → Settle
 ```
 
-CONTACT 阶段 NPC 主动联络、邀请活动。ACTIVITY 阶段按计划执行 solo/joint/public 活动，同地点 ≥2 人自动触发偶遇对话。
+CONTACT 阶段 NPC 主动联络、邀请活动。ACTIVITY 阶段按计划执行 solo/joint/public 活动，同地点 ≥2 人自动触发偶遇对话。（new）
 
 ### 偶遇 (WorldState + EncounterPipeline)
 
@@ -43,24 +38,20 @@ CONTACT 阶段 NPC 主动联络、邀请活动。ACTIVITY 阶段按计划执行 
 
 ### 数据分析
 
-```bash
-python scripts/compute_metrics.py --data-dir <run_id>
-```
 
 可分析维度：
-- 情感变化 — mood/material/social/esteem 四维满足感时序
+- 情感变化 — mood/material/social/esteem 四维满足感时序（new）
 - 社交关系 — 主动/被动联络次数、自我中心网络
 - 活动分布 — 各地点热度、活动类型占比
 - 经济状态 — 存款变化、消费金额、额外收入
 - Token 消耗 — 按周/按 agent 的 LLM 调用成本
 
-输出 `analysis/<run_id>/metrics.json`，按周+按年两层聚合。
 
 ---
 
 ## Player 状态
 
-Player 系统已部分实现（终端交互、PLAN/CONTACT/Signup/Settle），当前 **暂停开发**，聚焦 NPC 社群完善后再回来做。
+Player 系统已部分实现，当前**暂停开发**
 
 ---
 
