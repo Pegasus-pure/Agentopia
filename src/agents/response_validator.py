@@ -181,7 +181,7 @@ def validate_solo_activity_format(resp: str) -> ValidationResult:
     2. Activity section must have content after the colon
     """
     # Check if "Activity:" exists (case-insensitive, allow whitespace variations)
-    activity_pattern = r"\n\s*Activity\s*:\s*(.+)"
+    activity_pattern = r"(?:^|\n)\s*Activity\s*:\s*(.+)"
     match = re.search(activity_pattern, resp, re.IGNORECASE | re.DOTALL)
 
     if not match:
@@ -212,7 +212,7 @@ def extract_activity_content(resp: str) -> str:
         The activity content (everything after "Activity:"), or full response if pattern not found
     """
     # Match "Activity:" and capture everything after it
-    activity_pattern = r"\n\s*Activity\s*:\s*(.+)"
+    activity_pattern = r"(?:^|\n)\s*[#*_]*\s*Activity\s*[#*_]*\s*:\s*(.+)"
     match = re.search(activity_pattern, resp, re.IGNORECASE | re.DOTALL)
 
     if match:

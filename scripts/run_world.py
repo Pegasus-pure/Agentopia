@@ -195,6 +195,13 @@ def main() -> None:
         run_cfg_path = Path("data") / data_dir / "config.json"
 
         if args.run_id and run_cfg_path.exists():
+            # --run-id 指向已存在的目录，但未指定 --resume / --resume-from / --resume-year
+            # 这是危险操作：会导致 state.jsonl 脏数据追加，直接拒绝
+            if not args.resume and not resume_from_parsed:
+                parser.error(
+                    f"Run directory already exists: data/{data_dir}. "
+                    f"Use --resume to resume, or omit --run-id to generate a fresh run-id."
+                )
             # Resuming a previous run: load its config directly
             cli_overrides = [
                 name for name, val in [
@@ -225,6 +232,9 @@ def main() -> None:
                 raw_config["world"]["time"]["n_week"] = args.weeks
             raw_config["world"]["name"] = base_world_name
             raw_config["world"]["data_dir"] = data_dir
+            # Persist CLI-only params so resume can restore them
+            if args.max_agents is not None:
+                raw_config["max_agents"] = args.max_agents
             save_run_config(data_dir, raw_config)
             load_config(run_cfg_path)
 
@@ -240,6 +250,12 @@ def main() -> None:
     from src.config import get_config
 
     cfg = get_config()
+    # Resolve max_agents: CLI override > persisted config > None (load all)
+    max_agents = (
+        args.max_agents
+        if args.max_agents is not None
+        else cfg.get("max_agents")
+    )
     player_enabled = cfg.get("world", {}).get("enable_player", False)
 
     # Determine resume_from: CLI override or auto-detect from checkpoint
@@ -251,7 +267,7 @@ def main() -> None:
         no_context_engineering=args.no_ce,
         parallel=args.parallel,
         no_history=args.no_history,
-        max_agents=args.max_agents,
+        max_agents=max_agents,
         player_enabled=player_enabled,
         resume_from=resume_from,
     )

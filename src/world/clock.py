@@ -70,22 +70,32 @@ class TimeState:
     day: int = 0
     slot: int = 0
     phase: Optional[DayPhase] = None
+    step_cycle: int = 0
 
     def __str__(self) -> str:
         """Convert this TimeState to its string representation.
 
-        - ACTIVITY stage (with phase, n_phases>1):
-            "Y{year}-W{week}-activity-D{day}-P{phase_name}"
-        - ACTIVITY stage (no phase or n_phases=1):
-            "Y{year}-W{week}-activity-D{day}"
-        - CONTACT stage:  "Y{year}-W{week}-contact-S{slot}"
-        - Other stages:   "Y{year}-W{week}-{stage}"
+        Format:
+            "Y{year}-W{week}[-C{cycle}][-D{day}]-{stage}[-D{day}][-S{slot}][-P{phase}]"
+
+        C (step cycle) ensures chronological ordering via from_string/__lt__.
+        D (day) is included when day > 0 for human readability (daily/weekly/yearly).
+
+        Examples:
+            "Y2025-W01-C1-D01-plan"             (cycle=1, day=1, PLAN)
+            "Y2025-W01-C1-D01-activity-P{morning}" (ACTIVITY with phase)
+            "Y2025-W01-C6-D06-settle"           (weekly summary, day=6)
+            "Y2025-W01-C50-D99-settle"          (year-end summary)
         """
-        parts = [f"Y{self.year}", f"W{self.week:02d}", self.stage.name.lower()]
+        parts = [f"Y{self.year}", f"W{self.week:02d}"]
+        if self.step_cycle > 0:
+            parts.append(f"C{self.step_cycle}")
+        parts.append(self.stage.name.lower())
+        if self.day > 0:
+            parts.append(f"D{self.day:02d}")
         if self.stage == Stage.CONTACT:
             parts.append(f"S{self.slot}")
         elif self.stage == Stage.ACTIVITY:
-            parts.append(f"D{self.day}")
             if self.phase is not None:
                 # Suppress -P suffix in degraded mode (n_phases == 1)
                 day_phases_cfg = config["world"]["time"].get("day_phases", {})
@@ -102,7 +112,13 @@ class TimeState:
     def from_string(cls, s: str) -> TimeState:
         """Parse a TimeState object back from its string representation.
 
-        Supported formats:
+        Supported formats (new, with step_cycle):
+        - "Y{year}-W{week}-C{cycle}-{stage}" (e.g. "Y2025-W01-C1-plan")
+        - "Y{year}-W{week}-C{cycle}-{stage}-D{day}" (e.g. "Y2025-W01-C1-activity-D3")
+        - "Y{year}-W{week}-C{cycle}-{stage}-D{day}-P{phase}" (e.g. "Y2025-W01-C1-activity-D3-P{morning}")
+        - "Y{year}-W{week}-C{cycle}-{stage}-S{slot}" (e.g. "Y2025-W01-C2-contact-S6")
+
+        Supported formats (old, backward compat, no step_cycle):
         - "Y{year}-W{week}-{stage}" (e.g. "Y2025-W01-plan")
         - "Y{year}-W{week}-{stage}-D{day}" (e.g. "Y2025-W01-activity-D3")
         - "Y{year}-W{week}-{stage}-D{day}-P{phase}" (e.g. "Y2025-W01-activity-D3-P{morning}")
@@ -129,16 +145,24 @@ class TimeState:
             )
         week = int(parts[1][1:])
 
-        # 3. Parse Stage / Day / Slot / Phase
+        # 3. Parse optional step_cycle ("C{cycle}")
+        step_cycle = 0
+        idx = 2
+        if parts[idx].startswith("C"):
+            step_cycle = int(parts[idx][1:])
+            idx += 1
+
+        # 4. Parse Stage / Day / Slot / Phase
         stage: Stage
         day = 0
         slot = 0
         phase: Optional[DayPhase] = None
 
-        p2 = parts[2]
+        p2 = parts[idx]
+        idx += 1
 
         stage = Stage[p2.upper()]
-        extras = parts[3:]
+        extras = parts[idx:]
         for part in extras:
             if part.startswith("D"):
                 day = int(part[1:])
@@ -149,14 +173,15 @@ class TimeState:
                 phase_name = part[1:].strip("{}")
                 phase = DayPhase[phase_name.upper()]
 
-        return cls(year=year, week=week, stage=stage, day=day, slot=slot, phase=phase)
+        return cls(year=year, week=week, stage=stage, day=day, slot=slot, phase=phase, step_cycle=step_cycle)
 
     def __eq__(self, other: object) -> bool:
         """Return True if all time components are equal."""
         if not isinstance(other, TimeState):
             return NotImplemented
         return (
-            self.year == other.year
+            self.step_cycle == other.step_cycle
+            and self.year == other.year
             and self.week == other.week
             and self.stage == other.stage
             and self.day == other.day
@@ -168,6 +193,9 @@ class TimeState:
         if not isinstance(other, TimeState):
             return NotImplemented
 
+        if self.step_cycle != other.step_cycle:
+            return self.step_cycle < other.step_cycle
+
         if self.year != other.year:
             return self.year < other.year
 
@@ -177,12 +205,13 @@ class TimeState:
         if self.stage != other.stage:
             return self.stage < other.stage
 
+        if self.day != other.day:
+            return self.day < other.day
+
         if self.stage == Stage.CONTACT:
             if self.slot != other.slot:
                 return self.slot < other.slot
         elif self.stage == Stage.ACTIVITY:
-            if self.day != other.day:
-                return self.day < other.day
             # Same day: compare phase (None comes before any phase)
             if self.phase is None and other.phase is not None:
                 return True
@@ -237,6 +266,15 @@ class Clock:
         self._day: int = 0
         self._slot: int = 0
         self._phase: Optional[DayPhase] = None
+        self._step_cycle: int = 0
+
+    def advance_step_cycle(self) -> None:
+        """Increment the step cycle counter.
+
+        Called once per step() to distinguish daily iterations of
+        repeated stages (PLAN/REVIEW/SETTLE) within the same week.
+        """
+        self._step_cycle += 1
 
     def set_year(self, year: int) -> None:
         self._year = year
@@ -308,7 +346,7 @@ class Clock:
         return DayPhase.from_config(day_phases_cfg)
 
     def get_time(self) -> TimeState:
-        return TimeState(self._year, self._week, self._stage, self._day, self._slot, self._phase)
+        return TimeState(self._year, self._week, self._stage, self._day, self._slot, self._phase, self._step_cycle)
 
     # Utilities for contact stage -------------------------------------------
     def prev_contact_slot(self) -> TimeState:
@@ -371,6 +409,18 @@ if __name__ == "__main__":
     print(t3)
     print(t4)
 
+    print("\n--- 1b. Test __str__ with step_cycle > 0 ---")
+    tc1 = TimeState(2025, 1, Stage.PLAN, step_cycle=1)
+    tc2 = TimeState(2025, 1, Stage.REVIEW, step_cycle=1)
+    tc3 = TimeState(2025, 1, Stage.PLAN, step_cycle=2)
+    tc4 = TimeState(2025, 1, Stage.ACTIVITY, day=3, step_cycle=1)
+    tc5 = TimeState(2025, 1, Stage.CONTACT, slot=6, step_cycle=1)
+    print(tc1)
+    print(tc2)
+    print(tc3)
+    print(tc4)
+    print(tc5)
+
     print("\n--- 2. Test TimeState comparison (logical order) ---")
     # Create in chronological order
     ts1 = TimeState(2025, 1, Stage.PLAN)
@@ -402,6 +452,16 @@ if __name__ == "__main__":
     print(f"[{t_eq1}] == [{t_eq2}] (equal): {t_eq1 == t_eq2}")
     print(f"[{t_eq1}] != [{ts1}] (not equal): {t_eq1 != ts1}")
 
+    print("\n--- 2b. Test step_cycle comparison ---")
+    # Same year/week/stage but different cycle → cycle decides
+    c1_review = TimeState(2025, 1, Stage.REVIEW, step_cycle=1)
+    c2_plan = TimeState(2025, 1, Stage.PLAN, step_cycle=2)
+    print(f"[{c1_review}] < [{c2_plan}] (C1-review < C2-plan): {c1_review < c2_plan}")
+    # Same cycle → falls through to year/week/stage
+    c1_plan = TimeState(2025, 1, Stage.PLAN, step_cycle=1)
+    c1_contact = TimeState(2025, 1, Stage.CONTACT, step_cycle=1)
+    print(f"[{c1_plan}] < [{c1_contact}] (C1-plan < C1-contact): {c1_plan < c1_contact}")
+
     print("\n--- 3. Test list sorting ---")
     # Create an unsorted list
     shuffled_list = [ts8, ts1, ts9, ts3, ts7, ts4, ts2, ts6, ts1_bc]
@@ -421,13 +481,39 @@ if __name__ == "__main__":
     assert sorted_list == [ts1, ts1_bc, ts2, ts3, ts4, ts6, ts7, ts8, ts9]
     print("\nSort verification passed!")
 
+    print("\n--- 3b. Test sorting with step_cycle ---")
+    mixed = [
+        TimeState(2025, 1, Stage.REVIEW, step_cycle=2),
+        TimeState(2025, 1, Stage.PLAN, step_cycle=1),
+        TimeState(2025, 1, Stage.PLAN, step_cycle=3),
+        TimeState(2025, 1, Stage.REVIEW, step_cycle=1),
+        TimeState(2025, 1, Stage.PLAN, step_cycle=0),
+    ]
+    print("Before sort:")
+    for t in mixed:
+        print(f"  {t}")
+    mixed_sorted = sorted(mixed)
+    print("\nAfter sort:")
+    for t in mixed_sorted:
+        print(f"  {t}")
+    assert mixed_sorted == sorted(mixed, key=lambda x: x.step_cycle)
+    print("\nCycle sort verification passed!")
+
     print("\n--- 4. Test from_string (new/old formats) ---")
+    # Old formats (no step_cycle)
     s_plan = "Y2025-W01-plan"
     s_bc = "Y2025-W01-before_contact"
     s_act = "Y2025-W01-activity-D3"
     s_con = "Y2025-W01-contact-S6"
     s_sum = "Y2025-W01-review"
     s_full = "Y2030-W50-activity-D1-S5"
+
+    # New formats (with step_cycle)
+    s_c1_plan = "Y2025-W01-C1-plan"
+    s_c1_act = "Y2025-W01-C1-activity-D3"
+    s_c2_con = "Y2025-W01-C2-contact-S6"
+    s_c1_review = "Y2025-W01-C1-review"
+    s_c3_act = "Y2030-W50-C3-activity-D1"
 
     t_plan = TimeState.from_string(s_plan)
     t_bc = TimeState.from_string(s_bc)
@@ -436,14 +522,25 @@ if __name__ == "__main__":
     t_sum = TimeState.from_string(s_sum)
     t_full = TimeState.from_string(s_full)
 
+    ts_c1_plan = TimeState.from_string(s_c1_plan)
+    ts_c1_act = TimeState.from_string(s_c1_act)
+    ts_c2_con = TimeState.from_string(s_c2_con)
+    ts_c1_review = TimeState.from_string(s_c1_review)
+    ts_c3_act = TimeState.from_string(s_c3_act)
+
     print(f"'{s_plan}' -> {t_plan}")
     print(f"'{s_bc}' -> {t_bc}")
     print(f"'{s_act}'  -> {t_act}")
     print(f"'{s_con}'  -> {t_con}")
     print(f"'{s_sum}'  -> {t_sum}")
     print(f"'{s_full}' -> {t_full}")
+    print(f"'{s_c1_plan}' -> {ts_c1_plan}")
+    print(f"'{s_c1_act}'  -> {ts_c1_act}")
+    print(f"'{s_c2_con}'  -> {ts_c2_con}")
+    print(f"'{s_c1_review}' -> {ts_c1_review}")
+    print(f"'{s_c3_act}'  -> {ts_c3_act}")
 
-    # Verify
+    # Verify old format
     assert t_plan == TimeState(2025, 1, Stage.PLAN, 0, 0)
     assert t_bc == TimeState(2025, 1, Stage.BEFORE_CONTACT, 0, 0)
     assert t_act == TimeState(2025, 1, Stage.ACTIVITY, 3, 0)
@@ -451,13 +548,27 @@ if __name__ == "__main__":
     assert t_sum == TimeState(2025, 1, Stage.REVIEW, 0, 0)
     assert t_full == TimeState(2030, 50, Stage.ACTIVITY, 1, 5)
 
+    # Verify new format
+    assert ts_c1_plan == TimeState(2025, 1, Stage.PLAN, 0, 0, step_cycle=1)
+    assert ts_c1_act == TimeState(2025, 1, Stage.ACTIVITY, 3, 0, step_cycle=1)
+    assert ts_c2_con == TimeState(2025, 1, Stage.CONTACT, 0, 6, step_cycle=2)
+    assert ts_c1_review == TimeState(2025, 1, Stage.REVIEW, 0, 0, step_cycle=1)
+    assert ts_c3_act == TimeState(2030, 50, Stage.ACTIVITY, 1, step_cycle=3)
+
     # Verify round-trip
-    # Note: t_full loses slot on round-trip because __str__ for ACTIVITY stage is lossy
+    # Old format: no cycle prefix for step_cycle=0
     assert str(t_plan) == s_plan
     assert str(t_bc) == s_bc
     assert str(t_act) == "Y2025-W01-activity-D3"
     assert str(t_con) == s_con
     assert str(t_sum) == s_sum
     assert str(t_full) == "Y2030-W50-activity-D1"  # lossy: slot dropped
+
+    # New format: cycle prefix for step_cycle>0
+    assert str(ts_c1_plan) == s_c1_plan
+    assert str(ts_c1_act) == "Y2025-W01-C1-activity-D3"
+    assert str(ts_c2_con) == s_c2_con
+    assert str(ts_c1_review) == s_c1_review
+    assert str(ts_c3_act) == "Y2030-W50-C3-activity-D1"  # lossy: slot dropped
 
     print("\nfrom_string parsing verification passed!")

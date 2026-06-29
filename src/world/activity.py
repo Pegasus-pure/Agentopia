@@ -104,6 +104,16 @@ class JointActivity(Activity):
     schedule: Schedule
     location_store: Optional[object] = None  # Injected dependency
 
+
+class EncounterActivity(JointActivity):
+    """Encounter dialog (collision-based impromptu conversation).
+
+    Shares the same dialog-turn logic as JointActivity; this class exists
+    solely to distinguish encounters from planned joint activities in type
+    annotations and caller code.
+    """
+    pass
+
     @classmethod
     def from_schedule(
         cls, schd: Schedule, agents: List[RoleAgent], location_store
@@ -743,6 +753,9 @@ class JointActivity(Activity):
 class SoloActivity(Activity):
     """Single-person activity with unified data-driven design."""
 
+    schedule: Optional[Schedule] = None  # Source schedule (provides location etc.)
+    location_store: Optional[object] = None  # Injected dependency for location text
+
     def __post_init__(self) -> None:
         """Auto-generate activity_id if not provided."""
         if self.activity_id is None:
@@ -779,7 +792,12 @@ class SoloActivity(Activity):
             )
 
         # Step 1: Agent enters solo activity (builds activity_context only)
-        agent.enter_solo_activity()
+        location_desc = (
+            self.location_store.get_surroundings_text(self.schedule.location)
+            if self.schedule and self.schedule.location and self.location_store
+            else None
+        )
+        agent.enter_solo_activity(location_desc=location_desc)
         if logger:
             logger.info(
                 f"[VERIFY-SOLO-STEP1] Agent entered solo activity, context built"
@@ -864,9 +882,14 @@ class SoloActivity(Activity):
                 f"[VERIFY-SOLO-STEP2] Content preview: {activity_content[:200]}..."
             )
 
-        # Step 3: Stage 1 - GodModel evaluates activity
+        # Step 3: Stage 1 - GodModel evaluates activity (with location context)
+        location_tag = (
+            f"[At {self.schedule.location}] "
+            if self.schedule and self.schedule.location
+            else ""
+        )
         outcome_text_or_none, is_consumption, deltas_or_none = (
-            self._evaluate_solo_activity(agent, activity_content)
+            self._evaluate_solo_activity(agent, f"{location_tag}{activity_content}")
         )
         if logger:
             logger.info(f"[VERIFY-SOLO-STEP3] Stage 1 evaluation completed")
@@ -903,7 +926,7 @@ class SoloActivity(Activity):
         if is_consumption:
             # Step 5a: Stage 2 - Generate consumption scenario and offers
             outcome_text, consumption_options_offered = (
-                self._generate_consumption_offers(agent, activity_content)
+                self._generate_consumption_offers(agent, f"{location_tag}{activity_content}")
             )
             if logger:
                 logger.info(

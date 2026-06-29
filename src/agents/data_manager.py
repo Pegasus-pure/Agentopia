@@ -220,6 +220,31 @@ class DataManager:
                         except Exception:
                             last_t = None  # corrupt line — skip check
                         if last_t is not None and new_t < last_t:
+                            # Check if an entry with new_t already exists in the file
+                            # (can happen on re-run with same run-id without clearing data)
+                            duplicate = False
+                            try:
+                                with path.open("r", encoding="utf-8") as rf:
+                                    for line in rf:
+                                        line = line.strip()
+                                        if not line:
+                                            continue
+                                        try:
+                                            entry = json.loads(line)
+                                            if entry.get("time") == obj["time"]:
+                                                duplicate = True
+                                                break
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                            if duplicate:
+                                # Skip duplicate write, log and return
+                                self.logger.warning(
+                                    f"Skipping duplicate time entry in {path.name}: {obj['time']}"
+                                )
+                                flock_unlock(f)
+                                return
                             raise ValueError(
                                 f"Time-order violation in {path.name}: "
                                 f"appending {new_t} after {last_t}"
@@ -709,7 +734,30 @@ class DataManager:
         - fulfillment: {mood: 50, material: 50, social: 50, esteem: 50}
         - skills: from profile["init_skills"]
         - assets: from profile["init_assets"] (deposit + possessions)
+
+        Defense: if state.jsonl already has entries (e.g. another call
+        initialized before this one flushed), return existing state
+        instead of creating duplicates.
         """
+        path = self.root / "state.jsonl"
+        # ── Defense against duplicate initialization ─────────────────────
+        # If state.jsonl already has content (written by an earlier call
+        # that hasn't been GC'd from cache yet), return existing state.
+        if path.exists() and path.stat().st_size > 0:
+            try:
+                entries = self._read_jsonl(
+                    path, max_lines=1, exclude_cur_t=False
+                )
+                if entries:
+                    self.logger.warning(
+                        f"[_initialize_state_from_profile] "
+                        f"state.jsonl already initialized for {self.char}, "
+                        f"skipping re-initialization"
+                    )
+                    return entries[-1]["content"]
+            except Exception:
+                pass  # fall through to initialization
+
         profile = self.read_profile()
         init_skills = profile["init_skills"]
         init_assets = profile["init_assets"]

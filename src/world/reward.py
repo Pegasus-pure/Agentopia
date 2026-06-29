@@ -745,16 +745,18 @@ FULFILLMENT_DIMS = ["mood", "material", "social", "esteem"]
 def compute_subjective_rewards(
     agents: List["RoleAgent"],
     time_str: str,
+    n_days: int | None = None,
 ) -> Dict[str, SubjectiveReward]:
     """Compute subjective rewards for all agents (pure data-driven).
 
-    1. Collect all fulfillment values across agents × weeks, separated by dimension
+    1. Collect all fulfillment values across agents × periods, separated by dimension
     2. Compute per-dimension threshold (bottom percentile of each dimension's values)
     3. For each agent: apply penalty to values below dimension threshold, then compute mean
 
     Args:
         agents: List of all RoleAgent instances
         time_str: Current time string
+        n_days: Override number of days to include (yearly=50). If None, reads from config.
 
     Returns:
         Dict[agent_name, SubjectiveReward]
@@ -765,11 +767,15 @@ def compute_subjective_rewards(
 
     config = get_config()
     reward_cfg = config["world"]["reward"]
-    granularity = reward_cfg.get("granularity", "weekly")
-    if granularity == "daily":
-        n_periods = reward_cfg.get("period_days", 5)
+    if n_days is not None:
+        granularity = "daily"
+        n_periods = n_days
     else:
-        n_periods = reward_cfg.get("period_weeks", 1)
+        granularity = reward_cfg.get("granularity", "weekly")
+        if granularity == "daily":
+            n_periods = reward_cfg.get("period_days", 5)
+        else:
+            n_periods = reward_cfg.get("period_weeks", 1)
     percentile = reward_cfg["misery_threshold_percentile"]
     penalty_value = reward_cfg["misery_penalty_value"]
 
@@ -787,7 +793,7 @@ def compute_subjective_rewards(
 
     for agent in agents:
         if granularity == "daily":
-            history = agent.dm.get_fulfillment_history_daily(n_periods=n_periods)
+            history = agent.dm.get_fulfillment_history_daily(n_days=n_periods)
         else:
             history = agent.dm.get_fulfillment_history(n_weeks=n_periods)
         agent_histories[agent.name] = history

@@ -14,7 +14,7 @@ from src.world.cleanup import clean_append_only_jsonl_before
 from src.world.god import init_god_module
 from src.utils import get_logger, pool_size, set_log_run_id
 from src.config import get_world_config, get_config
-from src.world.activity import JointActivity, SoloActivity
+from src.world.activity import EncounterActivity, JointActivity, SoloActivity
 from src.world.state import WorldState
 from src.world.action import Action
 
@@ -208,10 +208,22 @@ class World:
             with path.open("r", encoding="utf-8") as f:
                 assignment = json.load(f)
             self.logger.info(f"Loaded model assignment from {path}")
-            # Validate all names are present (Player doesn't need model, skip)
+            # Assign models for any missing agents (resume with changed persona set)
             missing = [n for n in names if n not in assignment and n != "Player"]
             if missing:
-                raise ValueError(f"model_assignment.json missing agents: {missing}")
+                self.logger.warning(
+                    f"model_assignment.json missing {len(missing)} agents, "
+                    f"assigning models for: {missing[:3]}{'...' if len(missing) > 3 else ''}"
+                )
+                models = self._role_models
+                # Deterministic assignment: hash the agent name + data_dir as seed
+                for name in missing:
+                    seed = abs(hash((name, self.data_dir))) % len(models)
+                    assignment[name] = models[seed]
+                # Persist updated assignment
+                with path.open("w", encoding="utf-8") as f:
+                    json.dump(dict(sorted(assignment.items())), f, indent=2, ensure_ascii=False)
+                self.logger.info(f"Updated model_assignment.json with {len(missing)} new agents")
             # Warn if config models differ from persisted assignment
             assigned_models = sorted(set(assignment.values()))
             config_models = sorted(self._role_models)
@@ -682,21 +694,17 @@ class World:
                     continue
 
                 self.clock.set_week(week)
+                self.step()
 
-                # Day loop: run one day at a time
-                n_day = self.config["time"]["n_day"]
-                for day in range(1, n_day + 1):
-                    self.clock.set_day(day)
-                    self.step()
-                    # Daily reward: subjective + economy only (NO LLM call)
-                    reward_cfg = self.config["reward"]
-                    if reward_cfg.get("granularity", "weekly") == "daily":
-                        self._calculate_daily_rewards(day)
-
-                # Weekly reward: social (LLM call) + normalize daily data
+                # Weekly reward: set day=6 to distinguish from daily D01-D05
+                self.clock.set_day(6)
                 self._calculate_weekly_rewards(week)
 
                 self._write_checkpoint(current_year, week)
+
+            # Year-end: set day=99 so yearly reward sorts after all daily/weekly
+            self.clock.set_day(99)
+            self._calculate_yearly_rewards()
 
             # Year-end (weekly rewards already calculated in the weekly loop)
             self._update_yearly_profiles()
@@ -723,6 +731,11 @@ class World:
             )
 
     def step(self) -> None:
+        self.clock.advance_step_cycle()
+        # Reset stage to BEGIN before _before_week_start, so that save_state
+        # calls inside it (fulfillment decay, weekly income) don't inherit
+        # the stale SETTLE/REVIEW stage from the previous step() iteration.
+        self.clock.set_stage(Stage.BEGIN)
         # Stage 0: before week start (fulfillment decay + weekly income)
         self._before_week_start()
         for agent in self.agents:
@@ -744,33 +757,6 @@ class World:
         else:
             for agent in self.agents:
                 agent.plan()
-
-        # After PLAN: generate explicit solo schedules for NPCs for every phase
-        t = self.clock.get_time()
-        n_days = self.config["time"]["n_day"]
-        day_phases = self.clock.get_phases()
-        for agent in self.agents:
-            if agent.name == "Player":
-                continue
-            for day in range(1, n_days + 1):
-                for phase in day_phases:
-                    activity_time = TimeState(
-                        year=t.year,
-                        week=t.week,
-                        stage=Stage.ACTIVITY,
-                        day=day,
-                        phase=phase,
-                    )
-                    solo_schd = Schedule(
-                        activity_id=make_activity_id("solo", activity_time, agent.name),
-                        activity_name="Solo",
-                        activity_time=activity_time,
-                        location=None,
-                        type="solo",
-                        status="created",
-                        participants=[agent.name],
-                    )
-                    agent.dm.add_schedule(solo_schd)
 
         # Stage 2: before_contact (God Model generates events → Agents respond)
         self.clock.set_stage(Stage.BEFORE_CONTACT)
@@ -852,6 +838,34 @@ class World:
         else:
             for agent in self.agents:
                 agent.finalize_contact()
+
+        # Solo schedule fallback: for days without joint/public, write solo schedule
+        t = self.clock.get_time()
+        n_days = self.config["time"]["n_day"]
+        public_locs, _ = self.location_store.list_all()
+        for agent in self.agents:
+            if agent.name == "Player":
+                continue
+            for day in range(1, n_days + 1):
+                schd = agent.dm.get_schedule_for_day(t.year, t.week, day)
+                if schd is not None:
+                    continue  # already has a schedule for this day
+                # Decide location: 50% home, 50% random public
+                if random.random() < 0.5:
+                    location = f"home/{agent.name}"
+                else:
+                    location = random.choice(sorted(public_locs)) if public_locs else f"home/{agent.name}"
+                activity_time = TimeState(year=t.year, week=t.week, stage=Stage.ACTIVITY, day=day)
+                solo_schd = Schedule(
+                    activity_id=make_activity_id("solo", activity_time, agent.name),
+                    activity_name="Solo Activity",
+                    activity_time=activity_time,
+                    location=location,
+                    type="solo",
+                    status="created",
+                    participants=[agent.name],
+                )
+                agent.dm.add_schedule(solo_schd)
 
         # Stage 5: activity (day × phase double loop)
         self.clock.set_stage(Stage.ACTIVITY)
@@ -1091,41 +1105,47 @@ class World:
 
                     # Thread pool large enough for all tasks to be submitted
                     total_tasks = n_joint + n_solo + n_public
-                    with ThreadPoolExecutor(max_workers=total_tasks) as ex:
-                        futures = []
 
-                        # Phase 1: Joint (1 slot each, highest priority)
-                        for act in joint_acts + encounter_acts:
-                            futures.append(ex.submit(run_with_slots, act.run, 1))
+                    if total_tasks == 0:
+                        self.logger.info(
+                            f"[ACTIVITY] No activities to execute in this phase, skipping"
+                        )
+                    else:
+                        with ThreadPoolExecutor(max_workers=total_tasks) as ex:
+                            futures = []
 
-                        # Phase 2: Solo (1 slot each, fast)
-                        # ── P203: Solo 感知同位置 NPC ──
-                        phase_positions = self.world_state.get_phase_positions()
-                        for act in solo_acts:
-                            ag_name = act.agents[0].name
-                            pos = self.world_state.get_position(ag_name)
-                            if pos:
-                                all_nearby = phase_positions.get(pos, [])
-                                act._nearby_names = [n for n in all_nearby if n != ag_name]
-                            else:
-                                act._nearby_names = []
+                            # Phase 1: Joint (1 slot each, highest priority)
+                            for act in joint_acts + encounter_acts:
+                                futures.append(ex.submit(run_with_slots, act.run, 1))
 
-                        for act in solo_acts:
-                            futures.append(ex.submit(run_with_slots, act.run, 1))
+                            # Phase 2: Solo (1 slot each, fast)
+                            # ── P203: Solo 感知同位置 NPC ──
+                            phase_positions = self.world_state.get_phase_positions()
+                            for act in solo_acts:
+                                ag_name = act.agents[0].name
+                                pos = self.world_state.get_position(ag_name)
+                                if pos:
+                                    all_nearby = phase_positions.get(pos, [])
+                                    act._nearby_names = [n for n in all_nearby if n != ag_name]
+                                else:
+                                    act._nearby_names = []
 
-                        # Phase 3: Public (sorted by participant count, small first)
-                        # Small Public completes faster, releases slots for others
-                        sorted_public = sorted(public_acts, key=lambda a: len(a.agents))
-                        for act in sorted_public:
-                            n_participants = len(act.agents)
-                            slots = min(n_participants, public_internal_parallelism)
-                            futures.append(
-                                ex.submit(run_with_slots, act.run, slots, parallel=True)
-                            )
+                            for act in solo_acts:
+                                futures.append(ex.submit(run_with_slots, act.run, 1))
 
-                        # Wait for all
-                        for f in futures:
-                            f.result()
+                            # Phase 3: Public (sorted by participant count, small first)
+                            # Small Public completes faster, releases slots for others
+                            sorted_public = sorted(public_acts, key=lambda a: len(a.agents))
+                            for act in sorted_public:
+                                n_participants = len(act.agents)
+                                slots = min(n_participants, public_internal_parallelism)
+                                futures.append(
+                                    ex.submit(run_with_slots, act.run, slots, parallel=True)
+                                )
+
+                            # Wait for all
+                            for f in futures:
+                                f.result()
                 else:
                     # Sequential fallback
                     # ── P203: Solo 感知同位置 NPC (sequential path) ──
@@ -1148,6 +1168,31 @@ class World:
 
                 # --- Phase: execute encounter dialogues via EncounterPipeline ---
                 # (detection already done above; now execute the actual LLM dialogs)
+
+                # Filter encounter groups: only groups with at least 1 solo NPC participate.
+                # Solo→solo: normal encounter. Solo→joint/public/encounter: post-activity.
+                # Groups with zero solo NPCs (all busy) are discarded.
+                from src.world.state import EncounterGroup as EG
+                filtered_encounters = []
+                for enc_group in encounters:
+                    has_solo = False
+                    for nm in enc_group.agent_names:
+                        agent = self._name2agent.get(nm)
+                        if not agent:
+                            continue
+                        schd = agent.get_schedule()
+                        if schd and schd.type == "solo":
+                            has_solo = True
+                            break
+                    if not has_solo:
+                        continue
+                    filtered_encounters.append(EG(
+                        location=enc_group.location,
+                        phase=enc_group.phase,
+                        agent_names=list(enc_group.agent_names),
+                    ))
+                encounters = filtered_encounters
+
                 from src.world.encounter_pipeline import EncounterPipeline
 
                 pipeline = EncounterPipeline()
@@ -1195,6 +1240,11 @@ class World:
                 # --- Phase: advance actions ---
                 self.world_state.advance_actions(1.0 / n_phases)
 
+            # --- End of day: daily reward ---
+            reward_cfg = self.config["reward"]
+            if reward_cfg.get("granularity", "weekly") == "daily":
+                self._calculate_daily_rewards(day)
+
         # Stage complete — discard WorldState
         self.world_state = None
 
@@ -1219,11 +1269,6 @@ class World:
         else:
             for agent in self.agents:
                 agent.settle_week()
-
-        # Save end-of-week state for every agent (W01-settle snapshot)
-        # This enables weekly fulfillment analysis (previously only W00-begin was saved)
-        for agent in self.agents:
-            agent.dm.save_state(agent.dm._read_state_current(exclude_cur_t=False))
 
         # ── F2: SETTLE stage 对所有 NPC 应用 fidelity 衰减 ──
         try:
@@ -1304,15 +1349,15 @@ class World:
     def _build_today_activities_all_types(
         self,
     ) -> tuple[
-        list["PublicActivity"],
+        list[PublicActivity],
         list[JointActivity],
-        list[JointActivity],
+        list[EncounterActivity],
         list[SoloActivity],
     ]:
         """Build today's activities for all types.
 
-        All activity types (joint, public, encounter) are read from agent schedules.
-        Agents without any schedule get Solo activity.
+        All activity types (joint, public, encounter, solo) are read from agent schedules.
+        Solo activities are built from schedule data with location, not as leftover.
 
         Priority handling (Encounter > Joint > Public) is done in agent.get_schedule().
 
@@ -1354,8 +1399,9 @@ class World:
                 f"Unknown schedule type '{stype}' for {agent.name}"
             )
 
-            # Solo schedules are handled separately at the end —
-            # they don't participate in joint/encounter/public building.
+            # Solo schedules are collected separately at the end —
+            # they don't participate in joint/encounter/public building,
+            # and are only built once per day (not per phase).
             if stype == "solo":
                 continue
 
@@ -1366,8 +1412,9 @@ class World:
             engaged.add(agent.name)
 
         # Build activities by type
-        def build_joint_or_encounter(stype: str) -> list[JointActivity]:
+        def build_joint_or_encounter(stype: str) -> list:
             """Build Joint or Encounter activities with strict validation."""
+            cls = EncounterActivity if stype == "encounter" else JointActivity
             acts = []
             for aid in sorted(schedules_by_type[stype].keys()):
                 schd, agent_names = schedules_by_type[stype][aid]
@@ -1386,7 +1433,7 @@ class World:
                 )
 
                 p_agents = [name2agent[n] for n in participants]
-                act = JointActivity.from_schedule(
+                act = cls.from_schedule(
                     schd, p_agents, location_store=self.location_store
                 )
                 acts.append(act)
@@ -1404,9 +1451,17 @@ class World:
             Joint takes priority (handled in get_schedule()), so that agent
             won't appear in agent_names here - this is correct behavior.
             """
+            current_phase = self.clock.get_time().phase
+            default_phase = self.clock.get_phases()[0] if self.clock.get_phases() else None
             acts = []
             for aid in sorted(schedules_by_type["public"].keys()):
                 schd, agent_names = schedules_by_type["public"][aid]
+
+                # Filter by phase: only include if schedule's phase matches current phase
+                # Default to default_phase if phase is None (backward compatibility)
+                schd_phase = schd.activity_time.phase if schd.activity_time.phase else default_phase
+                if schd_phase != current_phase:
+                    continue
 
                 if len(agent_names) < 1:
                     continue
@@ -1428,17 +1483,23 @@ class World:
         joint_acts = build_joint_or_encounter("joint")
         encounter_acts = build_joint_or_encounter("encounter")
 
-        # Solo for remaining agents (activity_id auto-generated in __post_init__)
+        # Public activities: NPC only participates in their chosen phase.
+        # (No longer spans the entire day.)
+        # Engagement is handled by the activity execution below.
+
+        # Solo for remaining agents (one per agent per day, built from schedule for location)
         solo_agents = [ag for ag in self.agents if ag.name not in engaged]
-        solo_acts = [
-            SoloActivity(
-                activity_id=None,
-                activity_name="Hanging out",
+        solo_acts = []
+        for ag in solo_agents:
+            schd = ag.dm.get_today_schedule()
+            solo_acts.append(SoloActivity(
+                activity_id=schd.activity_id if schd else None,
+                activity_name=(schd.activity_name if schd else None) or "Solo Activity",
                 time=t,
                 agents=[ag],
-            )
-            for ag in solo_agents
-        ]
+                schedule=schd,
+                location_store=self.location_store,
+            ))
 
         return public_acts, joint_acts, encounter_acts, solo_acts
 
@@ -1783,8 +1844,6 @@ class World:
         from src.world.reward import (
             compute_subjective_rewards,
             calculate_total_rewards,
-            save_rankings,          # needed to save empty rankings for day
-            save_social_metrics,    # skip: no social on daily
         )
         from src.utils import get_verify_logger
 
@@ -1798,7 +1857,7 @@ class World:
         # 1. Subjective Reward (no LLM — reads fulfillment from state.jsonl)
         # =====================================================================
         subj_rewards = compute_subjective_rewards(
-            self.agents, time_str=str(t), granularity="daily",
+            self.agents, time_str=str(t),
         )
         total_penalties = sum(r.n_penalties for r in subj_rewards.values())
         self.logger.info(
@@ -1870,10 +1929,97 @@ class World:
             )
 
     def _calculate_weekly_rewards(self, week: int) -> None:
-        """Calculate social rewards (LLM call) + aggregate daily data into weekly.
+        """Calculate weekly reward (NO LLM — subjective + economy only).
 
-        Called at the end of each week.
-        LLM cost: N calls to judge_others() (one per agent).
+        Social reward is placeholder 0.0 — real social computed yearly.
+        Called at the end of each week with clock.day=6.
+        """
+        from src.world.reward import (
+            compute_subjective_rewards,
+            calculate_total_rewards,
+            SocialReward,
+        )
+        from src.utils import get_verify_logger
+
+        verify_logger = get_verify_logger(feature="reward")
+        t = self.clock.get_time()
+        reward_cfg = self.config["reward"]
+
+        self.logger.info(f"== WEEKLY REWARD (no LLM) == year={t.year} week={week}")
+
+        # =====================================================================
+        # 1. Subjective Reward (from state.jsonl — no LLM)
+        # =====================================================================
+        subjective_rewards = compute_subjective_rewards(
+            self.agents, time_str=str(t),
+        )
+        total_penalties = sum(r.n_penalties for r in subjective_rewards.values())
+        self.logger.info(
+            f"Weekly subjective: {len(subjective_rewards)} agents, "
+            f"{total_penalties} misery penalties"
+        )
+
+        # =====================================================================
+        # 2. Economy Reward (deposit delta during this week)
+        # =====================================================================
+        economy_scores: Dict[str, float] = {}
+        for agent in self.agents:
+            deposit_end = agent.dm.get_deposit()
+            deposit_start = getattr(agent, "_week_start_deposit", deposit_end)
+            economy_scores[agent.name] = float(deposit_end - deposit_start)
+
+        self.logger.info(f"Weekly economy: {len(economy_scores)} agents")
+
+        # =====================================================================
+        # 3. Social Reward — placeholder (real social computed yearly with LLM)
+        # =====================================================================
+        social_rewards: Dict[str, SocialReward] = {
+            a.name: SocialReward(
+                agent_name=a.name, time=str(t),
+                affection_score=0.0, respect_score=0.0, combined_score=0.0,
+            )
+            for a in self.agents
+        }
+
+        # =====================================================================
+        # 4. Total Reward (Subjective + Economy; Social = 0 placeholder)
+        # =====================================================================
+        total_rewards = calculate_total_rewards(
+            social_rewards=social_rewards,
+            subjective_rewards=subjective_rewards,
+            economy_scores=economy_scores,
+            time_str=str(t),
+        )
+        self.logger.info(f"Weekly total: {len(total_rewards)} agents")
+
+        # =====================================================================
+        # 5. Save Per-Agent Reward Data (ranking=None → no LLM data)
+        # =====================================================================
+        def save_agent_weekly(agent):
+            social = social_rewards[agent.name]
+            subjective = subjective_rewards[agent.name]
+            total = total_rewards[agent.name]
+            agent.dm.save_reward(None, social, subjective, total)
+
+        if self.parallel:
+            with ThreadPoolExecutor(max_workers=pool_size(len(self.agents))) as ex:
+                list(ex.map(save_agent_weekly, self.agents))
+        else:
+            for agent in self.agents:
+                save_agent_weekly(agent)
+
+        if verify_logger:
+            verify_logger.info(
+                f"[VERIFY-REWARD] Weekly reward saved: Y{t.year}-W{t.week:02d}"
+            )
+
+        self.logger.info(f"== WEEKLY REWARD COMPLETE == year={t.year} week={week}")
+
+    def _calculate_yearly_rewards(self) -> None:
+        """Calculate yearly reward with LLM social evaluation.
+
+        Called at year-end with clock.day=99.
+        LLM cost: N calls to judge_others() (one per agent) — once per year.
         """
         from src.world.reward import (
             build_social_graphs,
@@ -1883,15 +2029,18 @@ class World:
             save_social_metrics,
             compute_subjective_rewards,
             calculate_total_rewards,
-            normalize_daily_to_weekly,
         )
         from src.utils import get_verify_logger
 
         verify_logger = get_verify_logger(feature="reward")
         t = self.clock.get_time()
         reward_cfg = self.config["reward"]
+        n_days = self.config["time"]["n_day"] * self.config["time"]["n_week"]
 
-        self.logger.info(f"== WEEKLY REWARD (LLM) == year={t.year} week={week}")
+        self.logger.info(
+            f"== YEARLY REWARD (LLM) == year={t.year} "
+            f"n_days_for_subjective={n_days}"
+        )
 
         # =====================================================================
         # 1. Social Reward — LLM call: judge_others() for each agent
@@ -1904,12 +2053,12 @@ class World:
 
         rankings_by_name = {r.agent_name: r for r in rankings}
 
-        # Persist rankings centrally
-        save_rankings(rankings, self.data_dir, t.year, week)
+        # Persist rankings centrally (yearly file)
+        save_rankings(rankings, self.data_dir, t.year, week=0)
 
         # Compute and save absolute social metrics
         social_metrics = compute_social_metrics(rankings, str(t))
-        save_social_metrics(social_metrics, self.data_dir, t.year, week)
+        save_social_metrics(social_metrics, self.data_dir, t.year, week=0)
 
         affection_graph, respect_graph = build_social_graphs(rankings)
 
@@ -1924,22 +2073,22 @@ class World:
             time_str=str(t),
             all_agent_names=[a.name for a in self.agents],
         )
-        self.logger.info(f"Weekly social: {len(social_rewards)} agents")
+        self.logger.info(f"Yearly social: {len(social_rewards)} agents")
 
         # =====================================================================
-        # 2. Subjective Reward (from state.jsonl — no LLM)
+        # 2. Subjective Reward (full year, no LLM)
         # =====================================================================
         subjective_rewards = compute_subjective_rewards(
-            self.agents, time_str=str(t), granularity="weekly",
+            self.agents, time_str=str(t), n_days=n_days,
         )
         total_penalties = sum(r.n_penalties for r in subjective_rewards.values())
         self.logger.info(
-            f"Weekly subjective: {len(subjective_rewards)} agents, "
+            f"Yearly subjective: {len(subjective_rewards)} agents, "
             f"{total_penalties} misery penalties"
         )
 
         # =====================================================================
-        # 3. Economy Reward (deposit delta during this week)
+        # 3. Economy Reward (deposit delta over full year)
         # =====================================================================
         economy_scores: Dict[str, float] = {}
         for agent in self.agents:
@@ -1947,12 +2096,23 @@ class World:
             deposit_start = getattr(agent, "_week_start_deposit", deposit_end)
             economy_scores[agent.name] = float(deposit_end - deposit_start)
 
-        self.logger.info(f"Weekly economy: {len(economy_scores)} agents")
+        self.logger.info(f"Yearly economy: {len(economy_scores)} agents")
 
         # =====================================================================
-        # 4. Total Reward
+        # 4. Total Reward (Social + Subjective + Economy)
         # =====================================================================
-        def save_agent_weekly_reward(agent):
+        total_rewards = calculate_total_rewards(
+            social_rewards=social_rewards,
+            subjective_rewards=subjective_rewards,
+            economy_scores=economy_scores,
+            time_str=str(t),
+        )
+        self.logger.info(f"Yearly total: {len(total_rewards)} agents")
+
+        # =====================================================================
+        # 5. Save Per-Agent Reward Data
+        # =====================================================================
+        def save_agent_yearly(agent):
             ranking = rankings_by_name[agent.name]
             social = social_rewards[agent.name]
             subjective = subjective_rewards[agent.name]
@@ -1961,15 +2121,14 @@ class World:
 
         if self.parallel:
             with ThreadPoolExecutor(max_workers=pool_size(len(self.agents))) as ex:
-                list(ex.map(save_agent_weekly_reward, self.agents))
+                list(ex.map(save_agent_yearly, self.agents))
         else:
             for agent in self.agents:
-                save_agent_weekly_reward(agent)
+                save_agent_yearly(agent)
 
         if verify_logger:
             verify_logger.info(
-                f"[VERIFY-REWARD] Weekly reward saved: Y{t.year}-W{week}"
+                f"[VERIFY-REWARD] Yearly reward saved: Y{t.year}"
             )
 
-        self.logger.info(f"== WEEKLY REWARD COMPLETE == year={t.year} week={week}")
-
+        self.logger.info(f"== YEARLY REWARD COMPLETE == year={t.year}")

@@ -1124,7 +1124,7 @@ def generate_with_fc(
             client = OpenAI(base_url=base_url, api_key=api_key)
 
             # Set per-request timeout on the client instance
-            req_timeout = kwargs.pop("timeout", 600)
+            req_timeout = kwargs.pop("timeout", 120)
             client = client.with_options(timeout=req_timeout)
 
             max_output_tokens = _get_max_tokens_for_model(model, kwargs)
@@ -1307,16 +1307,17 @@ def generate_with_fc(
                         f"finish_reason={finish_reason}"
                     )
 
-                # Format reasoning (ensure <think> tags) and prepend to content
+                # Content is the actual LLM response — clean, no think tags
                 content = msg.content or ""
                 content = content.strip()
 
-                # Some models may return residual thinking text + </think> tag in content — strip it
+                # Some models may return residual thinking text + </think> tag
+                # in the content field — strip it here so all downstream consumers
+                # get clean text. The reasoning is in reasoning_text if needed.
                 if "</think>" in content:
                     parts = content.split("</think>", 1)
                     residual_thinking = parts[0].strip()
                     content = parts[1].strip()
-                    # Merge residual thinking into reasoning_text
                     if residual_thinking:
                         if reasoning_text:
                             reasoning_text = (
@@ -1324,13 +1325,10 @@ def generate_with_fc(
                             )
                         else:
                             reasoning_text = residual_thinking
-                if reasoning_text:
-                    text = reasoning_text.strip()
-                    if not text.startswith("<think>"):
-                        text = f"<think>\n{text}"
-                    if not text.endswith("</think>"):
-                        text = f"{text}\n</think>"
-                    content = f"{text}\n\n{content}"
+
+                # reasoning_text is discarded here (only used for debug logging).
+                # Content is clean — no <think> prepended.
+                # If callers need reasoning, they should capture it from the API response directly.
 
                 output = []
                 if msg.tool_calls:
@@ -1837,7 +1835,7 @@ def _get_response(model: str, messages, max_tokens=None, **kwargs):
     )
 
     # Collapse to text across possible return shapes
-    text = out[-1]["content"].split("</think>")[-1].strip()
+    text = out[-1]["content"].strip()
     logger.info(f"Response: {text}")
     return text
 

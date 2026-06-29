@@ -7,7 +7,7 @@ from typing import Optional, Set
 
 
 def generate_run_id(now: Optional[datetime] = None) -> str:
-    """Return run_id in MMDDHHMM from local time."""
+    """Return run_id in MMDDHHMM from local time (8 digits)."""
     dt = now or datetime.now()
     return dt.strftime("%m%d%H%M")
 

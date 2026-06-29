@@ -432,7 +432,7 @@ The contact stage has just ended.
 Below are the scheduling results of this week's proposed joint activities (created or canceled) that are relevant to you:
 {scheduling_results}
 
-Now, please produce a summary of the contact stage, including the contact history, scheduling results, and your reflections on the contact stage. Do not generate plans for the future at this stage. Start your final answer with "Summary of the Contact Stage:\n\n".
+Now, please produce a summary of the contact stage, including the contact history, scheduling results, and your reflections on the contact stage. Do not generate plans for the future at this stage. Start your final answer with "Contact Summary:\n\n".
 """
 
 #  based on the contact history and scheduling result
@@ -579,13 +579,14 @@ Now, please reflect on the activity process and produce a summary and reflection
 
 Your final answer must strictly follow this exact format:
 
-Summary of the Activity:
+Activity:
 <Provide a brief summary of the activity process>
 
 Reflection:
 <Share your mindset shifts, emotional arc, and personal reflections on the activity>
 
-Begin your response with "Summary of the Activity:" on the first line.
+IMPORTANT: Output plain text only. Do NOT use markdown, bold (**), or any other formatting.
+Begin your response with "Activity:" on the first line.
 """
 
 
@@ -600,6 +601,7 @@ Your final answer must strictly follow this exact format:
 Reflection:
 <Share your thoughts, feelings, and reflections on the activity content and outcome>
 
+IMPORTANT: Output plain text only. Do NOT use markdown, bold (**), or any other formatting.
 Begin your response with "Reflection:" on the first line.
 """
 
@@ -628,6 +630,7 @@ Guidelines:
 Thinking: <your reasoning process as this character>
 Summary: <factual record of events, less than 300 words>
 Reflection: <personal thoughts and insights, less than 300 words>
+IMPORTANT: Output plain text only. Do NOT use markdown, bold (**), or any other formatting.
 """
 
 CONDENSE_WORKING_MEMORY_PROMPT = """Your task is to condense the Generation result (generated with context INPUT) into a concise summary of less than 1000 words. You should 
@@ -692,6 +695,7 @@ Important notes:
 ## Output Format
 Thinking: Your reasoning process as this character
 Activity: Describe what you will do and how you will do it (max 100 words)
+IMPORTANT: Output plain text only. Do NOT use markdown, bold (**), or any other formatting.
 """.strip()
 
 
@@ -1175,14 +1179,22 @@ Public events are open-entry, theme-based gatherings where participants:
 - Focus on the activity itself (not on socializing with others)
 - May notice other participants but do NOT interact directly with them
 
+## Available Phases
+When signing up, choose ONE phase (time slot) to attend the event:
+- dawn
+- morning
+- afternoon
+- dusk
+- night
+
 ## Instructions
 
 Decide which events you want to sign up for based on your interests, goals, personality, current schedule, energy level and commitments.
 
-- To sign up for an event, output a JSON block with "type": "signup" and "event_name" matching exactly one of the events listed above. Example:
+- To sign up for an event, output a JSON block with "type": "signup", "event_name" matching exactly one of the events listed above, and "phase" with your chosen phase. Example:
 ```
 [ACTION_JSON]
-{"type": "signup", "event_name": "Morning Yoga Flow"}
+{{"type": "signup", "event_name": "Morning Yoga Flow", "phase": "morning"}}
 [/ACTION_JSON]
 ```
 - You can sign up for multiple events (if no time conflicts) or none.
@@ -1292,6 +1304,7 @@ Important notes:
 ## Output Format
 Thinking: Your reasoning process as this character
 Activity: Describe what you will do and how you will do it (max 100 words)
+IMPORTANT: Output plain text only. Do NOT use markdown, bold (**), or any other formatting.
 """
 
 
@@ -1319,6 +1332,7 @@ Your final answer must strictly follow this exact format:
 Reflection:
 <Share your thoughts, feelings, and reflections on the activity>
 
+IMPORTANT: Output plain text only. Do NOT use markdown, bold (**), or any other formatting.
 Begin your response with "Reflection:" on the first line.
 """
 
