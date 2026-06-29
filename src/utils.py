@@ -1716,17 +1716,23 @@ def clip_str(s: str, max_len: int = 500) -> str:
         return s
 
 
-def affection_label(aff: int, resp: int) -> str:
-    """Map (affection, respect) delta totals to a human-readable relationship label.
+def affection_label(aff: int, resp: int, fam: int = 0) -> str:
+    """Map (affection, respect, familiarity) delta totals to a human-readable relationship label.
 
     Based on SCM (Stereotype Content Model) warmth × competence axes,
     extended to 3×3=9 labels with buffer zones for smoother transitions.
+    Familiarity < 5 biases toward "stranger" labels even if affection is neutral.
 
           respect ≥10    -5~9      ≤-5
     aff≥10  亲近信赖      宠爱/照顾   喜欢但看不上
     -9~9    仰慕/敬重     路人/无感   不屑/轻视
     aff≤-10 畏惧/忌惮     冷淡/疏远   反感/鄙视
     """
+    # Familiarity bias: low familiarity → "stranger"
+    if fam < 5:
+        if abs(aff) < 10 and abs(resp) < 10:
+            return "陌生人"
+
     if aff >= 10:
         if resp >= 10:
             return "亲近信赖"

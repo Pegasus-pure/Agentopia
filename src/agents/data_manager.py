@@ -34,6 +34,9 @@ double_indent = indent * 2
 _MISERY_SEVERE = 10
 _MISERY_MILD = 30
 
+# Weekly skill decay rate for unused skills (5% per week)
+SKILL_DECAY_RATE = 0.05
+
 
 def _misery_hint(val: int, pad: str = indent) -> str:
     """Return misery awareness hint if value is below thresholds."""
@@ -108,6 +111,10 @@ class DataManager:
     # Send sequence number: the index (starting from 1) of a message within the
     # current slot, keyed by the (slot_str, recipient) dimension
     _send_seq_map: Dict[Tuple[str, str], int] = field(init=False, default_factory=dict)
+    # Track how many times each skill was used this week (for frequency-based decay)
+    _skills_used_this_week: dict = field(init=False, default_factory=dict)
+    # Track which agents this agent had contact with this week (for familiarity decay)
+    _contacts_this_week: dict = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         self.logger = get_logger(f"agent_{self.char}", quiet=True)
@@ -794,6 +801,13 @@ class DataManager:
             f"{indent}  (10 = extremely exhausted/stressed/unhealthy, 30 = fatigued, 50 = baseline, 70 = energetic, 90 = highly relaxed and energized)"
         )
         vitality_line += _misery_hint(val, indent)
+
+        # Incapacitated: inject bedridden message
+        if state.get("incapacitated"):
+            vitality_line += (
+                f"\n{indent}(You are bedridden. You cannot participate in any activities this week. You are slowly recovering.)"
+            )
+
         return f"### Vitality\n{vitality_line}"
 
     def read_fulfillment_prompt(self) -> str:
@@ -1115,6 +1129,17 @@ class DataManager:
             current["fulfillment"][key] = new_value
         self.save_state(current)
 
+    def apply_skill_decay(self, decayed: Dict[str, int]) -> None:
+        """Apply skill decay values to current state skills.
+
+        Args:
+            decayed: Dict mapping skill name to new (decayed) value.
+        """
+        current = self._read_state_current(exclude_cur_t=False)
+        for skill_name, new_value in decayed.items():
+            current["skills"][skill_name] = new_value
+        self.save_state(current)
+
     def update_deposit(self, new_deposit: int) -> None:
         """Update deposit in state."""
         current = self._read_state_current(exclude_cur_t=False)
@@ -1350,6 +1375,9 @@ class DataManager:
             if not char_dir.exists():
                 return ""
             aff_lines = []
+            AFF_CAP = 100
+            RESP_CAP = 100
+            FAM_CAP = 100
             for sp_file in sorted(char_dir.iterdir()):
                 if not sp_file.suffix == ".jsonl":
                     continue
@@ -1359,24 +1387,32 @@ class DataManager:
                               if "affection_delta" in e]
                 resp_deltas = [e.get("respect_delta", 0) for e in entries
                                if "respect_delta" in e]
-                if not aff_deltas and not resp_deltas:
+                fam_deltas = [e.get("familiarity_delta", 0) for e in entries
+                              if "familiarity_delta" in e]
+                if not aff_deltas and not resp_deltas and not fam_deltas:
                     continue
                 aff_total = sum(aff_deltas)
                 resp_total = sum(resp_deltas)
+                fam_total = sum(fam_deltas)
+                # Cap all three
+                aff_total = max(-AFF_CAP, min(AFF_CAP, aff_total))
+                resp_total = max(-RESP_CAP, min(RESP_CAP, resp_total))
+                fam_total = max(0, min(FAM_CAP, fam_total))
                 recent = entries[-1].get("content", "") if entries else ""
 
                 from src.utils import affection_label
-                label = affection_label(aff_total, resp_total)
+                label = affection_label(aff_total, resp_total, fam_total)
 
                 aff_lines.append(
                     f"  {target}: aff={'+' if aff_total >= 0 else ''}{aff_total}"
                     f" resp={'+' if resp_total >= 0 else ''}{resp_total}"
+                    f" fam={fam_total}"
                     f" — {label}"
                     f"{' (' + recent + ')' if recent else ''}"
                 )
             if aff_lines:
                 return (
-                    "\n\n## Your Feelings Towards Others (aff=liking, resp=respect)\n"
+                    "\n\n## Your Feelings Towards Others (aff=liking, resp=respect, fam=familiarity)\n"
                     + "\n".join(aff_lines)
                 )
             return ""
@@ -3136,6 +3172,17 @@ class DataManager:
             0, min(100, current["vitality"] + outcome.delta_vitality)
         )
 
+        # Vitality tiered states
+        VITALITY_WARNING = 20
+        VITALITY_CRITICAL = 10
+        if current["vitality"] <= 0:
+            current["incapacitated"] = True
+            current["incapacitated_reason"] = "vitality_depleted"
+        elif current["vitality"] <= VITALITY_CRITICAL:
+            current["is_critically_exhausted"] = True
+        elif current["vitality"] <= VITALITY_WARNING:
+            current["is_exhausted"] = True
+
         # Fulfillment
         for key, delta in outcome.delta_fulfillment.items():
             if key in current["fulfillment"]:
@@ -3146,6 +3193,7 @@ class DataManager:
         # Skills
         for skill, delta in outcome.delta_skills.items():
             current["skills"][skill] = max(0, current["skills"].get(skill, 0) + delta)
+            self._skills_used_this_week[skill] = self._skills_used_this_week.get(skill, 0) + 1
 
         # Money (Solo only)
         if hasattr(outcome, "delta_money"):

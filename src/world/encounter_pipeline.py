@@ -818,6 +818,23 @@ class EncounterPipeline:
                     except Exception:
                         pass
 
+            # 6b. P203: Add familiarity_delta (default +1 per encounter)
+            for participant in participants:
+                for other in participants:
+                    if participant.name == other.name:
+                        continue
+                    try:
+                        sp_path = participant.dm.character_scratchpads / f"{other.name}.jsonl"
+                        sp_path.parent.mkdir(parents=True, exist_ok=True)
+                        participant.dm._append_jsonl(sp_path, {
+                            "content": "encounter",
+                            "familiarity_delta": 1,
+                        })
+                        # Track contact for familiarity decay
+                        participant.dm._contacts_this_week[other.name] = participant.dm._contacts_this_week.get(other.name, 0) + 1
+                    except Exception:
+                        pass
+
             # 7. Record encounter summary to each participant's scratchpad
             #    Zero LLM: splice first 2 lines + total turn count
             time_str = str(self._clock.get_time()) if hasattr(self, '_clock') else ""

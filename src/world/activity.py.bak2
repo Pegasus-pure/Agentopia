@@ -119,6 +119,15 @@ class JointActivity(Activity):
         )
 
 
+class EncounterActivity(JointActivity):
+    """Encounter dialog (collision-based impromptu conversation).
+
+    Shares the same dialog-turn logic as JointActivity; this class exists
+    solely to distinguish encounters from planned joint activities in type
+    annotations and caller code.
+    """
+    pass
+
     def _parse_gift_actions(
         self, response: str, sender_name: str
     ) -> Tuple[List[Tuple[str, str, str]], Dict[str, str]]:
@@ -738,15 +747,6 @@ class JointActivity(Activity):
             logger.info(
                 f"[VERIFY-JOINT] ========== Joint activity completed for all {len(self.agents)} participants =========="
             )
-
-class EncounterActivity(JointActivity):
-    """Encounter dialog (collision-based impromptu conversation).
-
-    Shares the same dialog-turn logic as JointActivity; this class exists
-    solely to distinguish encounters from planned joint activities in type
-    annotations and caller code.
-    """
-    pass
 
 
 @dataclass

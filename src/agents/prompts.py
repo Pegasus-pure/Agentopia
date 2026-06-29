@@ -707,7 +707,8 @@ VITALITY_DESC = """
 - 70-89: Good condition, normal daily activities without issue (typical healthy state)
 - 50-69: Tired, needs rest, reduced efficiency
 - 30-49: Exhausted, difficulty concentrating
-- 0-29: Severely depleted, needs immediate rest, may get sick
+- 10-29: Critically exhausted, barely functional
+- 0: Incapacitated (bedridden, cannot participate in any activities, slowly recovering)
 """.strip()
 
 
@@ -1832,9 +1833,9 @@ Design exactly **{count}** NEW challenging **work** position(s).
 ## Requirements
 
 ### 1. Challenge Gap (CRITICAL)
-Each new position's min_skills must be **at least 50 points higher** than the current highest agent skill for that skill type.
+Each new position's min_skills must be **at least 20 points higher** than the current highest agent skill for that skill type.
 
-Example: If highest agent "teaching" = 80, then min_skills["teaching"] >= 130.
+Example: If highest agent "teaching" = 80, then min_skills["teaching"] >= 100.
 
 **Note**: You may introduce NEW skill types not listed above. For new skills, the threshold is 50 (since current max = 0).
 

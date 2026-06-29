@@ -174,6 +174,43 @@ def main() -> None:
 
         load_config(run_cfg_path)
         print(f"[run_world] Resuming from {run_dir} (config loaded)")
+
+        # Apply safe CLI overrides on top of persisted config
+        from src.config import get_config
+        cfg = get_config()
+        overrides_applied = []
+        if args.years is not None:
+            cfg["world"]["time"]["n_year"] = args.years
+            overrides_applied.append(f"--years {args.years}")
+        if args.max_agents is not None:
+            cfg["max_agents"] = args.max_agents
+            overrides_applied.append(f"--max-agents {args.max_agents}")
+        if args.role_model is not None:
+            models = [m.strip() for m in args.role_model.split(",") if m.strip()]
+            cfg["role_model"] = models[0] if len(models) == 1 else models
+            overrides_applied.append(f"--role-model {args.role_model}")
+        if args.god_model is not None:
+            cfg["god_model"] = args.god_model
+            overrides_applied.append(f"--god-model {args.god_model}")
+        if args.weeks is not None:
+            # Safe only when all configured weeks already completed
+            cp = run_dir / "checkpoint.json"
+            if cp.exists():
+                import json as _json
+                cp_data = _json.loads(cp.read_text(encoding="utf-8"))
+                saved_week = cp_data.get("week", 0)
+                if saved_week >= cfg["world"]["time"]["n_week"]:
+                    cfg["world"]["time"]["n_week"] = args.weeks
+                    overrides_applied.append(f"--weeks {args.weeks}")
+                else:
+                    print(f"[run_world] WARNING: --weeks override ignored during resume "
+                          f"(checkpoint week={saved_week} < n_week={cfg['world']['time']['n_week']}, "
+                          f"mid-run n_week change would break checkpoint semantics)")
+            else:
+                cfg["world"]["time"]["n_week"] = args.weeks
+                overrides_applied.append(f"--weeks {args.weeks}")
+        if overrides_applied:
+            print(f"[run_world] Resume overrides applied: {', '.join(overrides_applied)}")
     else:
         # ── Normal flow: new run or --run-id resume ─────────────────────
         # Read root config.json as raw input (not yet loaded into global _CONFIG)
@@ -202,18 +239,43 @@ def main() -> None:
                     f"Run directory already exists: data/{data_dir}. "
                     f"Use --resume to resume, or omit --run-id to generate a fresh run-id."
                 )
-            # Resuming a previous run: load its config directly
-            cli_overrides = [
-                name for name, val in [
-                    ("--world", args.world), ("--language", args.language),
-                    ("--role-model", args.role_model), ("--god-model", args.god_model),
-                    ("--years", args.years), ("--weeks", args.weeks),
-                ] if val is not None
-            ]
-            if cli_overrides:
-                print(f"[run_world] WARNING: Resuming run {args.run_id}, "
-                      f"CLI overrides ignored: {', '.join(cli_overrides)}")
+            # Resuming a previous run: load its config, then apply safe CLI overrides
             load_config(run_cfg_path)
+            from src.config import get_config
+            cfg = get_config()
+            overrides_applied = []
+            if args.years is not None:
+                cfg["world"]["time"]["n_year"] = args.years
+                overrides_applied.append(f"--years {args.years}")
+            if args.weeks is not None:
+                # Safe only when all configured weeks already completed
+                run_dir_for_cp = Path("data") / data_dir
+                cp = run_dir_for_cp / "checkpoint.json"
+                if cp.exists():
+                    cp_data = json.loads(cp.read_text(encoding="utf-8"))
+                    saved_week = cp_data.get("week", 0)
+                    if saved_week >= cfg["world"]["time"]["n_week"]:
+                        cfg["world"]["time"]["n_week"] = args.weeks
+                        overrides_applied.append(f"--weeks {args.weeks}")
+                    else:
+                        print(f"[run_world] WARNING: --weeks override ignored during resume "
+                              f"(checkpoint week={saved_week} < n_week={cfg['world']['time']['n_week']}, "
+                              f"mid-run n_week change would break checkpoint semantics)")
+                else:
+                    cfg["world"]["time"]["n_week"] = args.weeks
+                    overrides_applied.append(f"--weeks {args.weeks}")
+            if args.max_agents is not None:
+                cfg["max_agents"] = args.max_agents
+                overrides_applied.append(f"--max-agents {args.max_agents}")
+            if args.role_model is not None:
+                models = [m.strip() for m in args.role_model.split(",") if m.strip()]
+                cfg["role_model"] = models[0] if len(models) == 1 else models
+                overrides_applied.append(f"--role-model {args.role_model}")
+            if args.god_model is not None:
+                cfg["god_model"] = args.god_model
+                overrides_applied.append(f"--god-model {args.god_model}")
+            if overrides_applied:
+                print(f"[run_world] Resume overrides applied: {', '.join(overrides_applied)}")
         else:
             # New run: apply CLI overrides, save to run directory, then load
             if args.role_model is not None:

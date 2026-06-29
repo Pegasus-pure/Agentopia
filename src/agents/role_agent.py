@@ -396,6 +396,14 @@ class RoleAgent:
         t = self.clock.get_time()
         self.logger.info(f"[PLAN][year={t.year} week={t.week}] start planning")
 
+        # Check for incapacitated state: if bedridden, skip all physical activities
+        state = self.dm.read_state()
+        if state.get("incapacitated"):
+            self.logger.info(
+                f"[PLAN] {self.name} is incapacitated, skipping activity planning"
+            )
+            return
+
         inputs = self.dm.roleplay_prompt() + self.dm.plan_prompt()
 
         outputs = self._generate_with_functions(inputs)
@@ -464,14 +472,10 @@ class RoleAgent:
                         )
                         standard = "frugal"
 
-        # Cost and material delta mapping
-        cost_map = {
-            "frugal": 100,
-            "moderate": 200,
-            "comfortable": 300,
-            "luxurious": 500,
-        }
-        material_map = {"frugal": -5, "moderate": 0, "comfortable": 5, "luxurious": 10}
+        # Cost and material delta mapping (read from config)
+        std_config = self.config["world"]["economy"]["living_standards"]
+        cost_map = {k: v["cost"] for k, v in std_config.items()}
+        material_map = {k: v["material_delta"] for k, v in std_config.items()}
 
         cost = cost_map[standard]
         material_delta = material_map[standard]

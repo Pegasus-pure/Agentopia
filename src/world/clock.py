@@ -193,8 +193,9 @@ class TimeState:
         if not isinstance(other, TimeState):
             return NotImplemented
 
-        if self.step_cycle != other.step_cycle:
-            return self.step_cycle < other.step_cycle
+        # Compare by logical time hierarchy: year → week → stage → day → slot → phase
+        # step_cycle is LAST — it is a global monotonic counter within a single run
+        # but resets on resume, so it MUST NOT dominate cross-run comparisons.
 
         if self.year != other.year:
             return self.year < other.year
@@ -212,7 +213,6 @@ class TimeState:
             if self.slot != other.slot:
                 return self.slot < other.slot
         elif self.stage == Stage.ACTIVITY:
-            # Same day: compare phase (None comes before any phase)
             if self.phase is None and other.phase is not None:
                 return True
             if self.phase is not None and other.phase is None:
@@ -220,6 +220,10 @@ class TimeState:
             if self.phase is not None and other.phase is not None:
                 if self.phase != other.phase:
                     return self.phase < other.phase
+
+        # Final tiebreaker: within the same logical time, lower step_cycle comes first
+        if self.step_cycle != other.step_cycle:
+            return self.step_cycle < other.step_cycle
 
         return False
 
@@ -453,10 +457,16 @@ if __name__ == "__main__":
     print(f"[{t_eq1}] != [{ts1}] (not equal): {t_eq1 != ts1}")
 
     print("\n--- 2b. Test step_cycle comparison ---")
-    # Same year/week/stage but different cycle → cycle decides
+    # step_cycle is now the LAST tiebreaker (after year/week/stage/day/phase)
+    # Same year/week but different stage → stage decides, not step_cycle
     c1_review = TimeState(2025, 1, Stage.REVIEW, step_cycle=1)
     c2_plan = TimeState(2025, 1, Stage.PLAN, step_cycle=2)
     print(f"[{c1_review}] < [{c2_plan}] (C1-review < C2-plan): {c1_review < c2_plan}")
+    # REVIEW > PLAN by stage ordering, so c1_review < c2_plan is False
+    # step_cycle only matters when all logical time fields are equal
+    ts_same_review = TimeState(2025, 1, Stage.REVIEW, step_cycle=1)
+    ts_diff_review = TimeState(2025, 1, Stage.REVIEW, step_cycle=2)
+    print(f"[{ts_same_review}] < [{ts_diff_review}] (C1-review < C2-review): {ts_same_review < ts_diff_review}")
     # Same cycle → falls through to year/week/stage
     c1_plan = TimeState(2025, 1, Stage.PLAN, step_cycle=1)
     c1_contact = TimeState(2025, 1, Stage.CONTACT, step_cycle=1)

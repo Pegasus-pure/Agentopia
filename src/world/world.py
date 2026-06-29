@@ -431,6 +431,8 @@ class World:
                 events[evt.event_id] = evt
         return events
 
+    SKILL_DECAY_RATE = 0.05  # 5% per week for unused skills
+
     def _apply_fulfillment_decay(self) -> None:
         """Apply proportional fulfillment decay: value * (1 - ratio) per dimension."""
         from src.utils import get_verify_logger
@@ -491,6 +493,92 @@ class World:
             elif verify_logger:
                 verify_logger.warning(f"[VERIFY-ECONOMY] {agent.name} has zero income")
 
+    def _apply_skill_decay(self) -> None:
+        """Apply weekly skill decay with frequency-based rates.
+
+        Decay rates per usage tier:
+        - 0 uses:    5% decay (full decay)
+        - 5-10 uses: 2% decay (slight maintenance)
+        - 10+ uses:  no decay (skill maintained)
+        """
+        for agent in self.agents:
+            state = agent.dm.read_state()
+            skills = state.get("skills", {})
+            if not skills:
+                continue
+
+            used_counts = getattr(agent.dm, "_skills_used_this_week", {})
+
+            decayed = {}
+            for skill_name, value in skills.items():
+                use_count = used_counts.get(skill_name, 0)
+                if use_count < 5:
+                    decay_rate = 0.05      # 0-4 uses → 5% decay (barely used)
+                elif use_count < 10:
+                    decay_rate = 0.02      # 5-9 uses → 2% decay (slight decay)
+                else:
+                    continue               # 10+ uses → no decay (well maintained)
+                new_value = max(0, int(value * (1 - decay_rate)))
+                decayed[skill_name] = new_value
+
+            if decayed:
+                from src.utils import get_verify_logger
+                verify_logger = get_verify_logger(feature="skill_decay")
+                if verify_logger:
+                    verify_logger.info(
+                        f"[VERIFY-SKILL-DECAY] {agent.name}: {len(decayed)} skills decayed"
+                    )
+                agent.dm.apply_skill_decay(decayed)
+
+            # Reset tracking for next week
+            agent.dm._skills_used_this_week = {}
+
+    def _apply_familiarity_decay(self) -> None:
+        """Apply weekly familiarity decay with frequency-based rates.
+
+        Decay rates per contact tier:
+        - 0 contacts:      5% decay (no interaction → rapid fade)
+        - 5-9 contacts:    2% decay (occasional → slight fade)
+        - 10+ contacts:    no decay (frequent contact → maintained)
+        """
+        for agent in self.agents:
+            contacts_this_week = getattr(agent.dm, "_contacts_this_week", {})
+
+            char_dir = agent.dm.character_scratchpads
+            if not char_dir.exists():
+                continue
+
+            for sp_file in char_dir.iterdir():
+                if not sp_file.suffix == ".jsonl":
+                    continue
+                target = sp_file.stem
+                contact_count = contacts_this_week.get(target, 0)
+
+                if contact_count >= 10:
+                    continue  # 10+ contacts → no decay
+
+                # Read current familiarity total
+                entries = agent.dm._read_jsonl(sp_file, max_lines=50)
+                fam_deltas = [e.get("familiarity_delta", 0) for e in entries if "familiarity_delta" in e]
+                if not fam_deltas:
+                    continue
+                current_fam = sum(fam_deltas)
+                if current_fam <= 0:
+                    continue
+
+                if contact_count < 5:
+                    decay_rate = 0.05      # 0-4 contacts → 5% decay
+                else:
+                    decay_rate = 0.02      # 5-9 contacts → 2% decay
+
+                decay = int(current_fam * decay_rate)
+                if decay > 0:
+                    sp_path = char_dir / f"{target}.jsonl"
+                    agent.dm._append_jsonl(sp_path, {
+                        "content": "familiarity_decay",
+                        "familiarity_delta": -decay,
+                    })
+
     def _before_week_start(self) -> None:
         """Execute all operations that should happen before each week starts."""
         # Record each agent's deposit at week start (for weekly economy reward)
@@ -499,6 +587,11 @@ class World:
 
         self._apply_fulfillment_decay()
         self._settle_weekly_income()
+        self._apply_skill_decay()
+        self._apply_familiarity_decay()
+        # Reset contact tracking for next week
+        for agent in self.agents:
+            agent.dm._contacts_this_week = {}
 
     def _run_position_application_season(self) -> None:
         """Run position application season at year end.
@@ -1286,6 +1379,20 @@ class World:
                         )
         except Exception:
             self.logger.warning("[F2] Fidelity decay phase failed", exc_info=True)
+
+        # ── Compress rumors: keep only most recent rumors ──
+        try:
+            self.logger.info("[F2] Compressing rumors for all NPCs")
+            for agent in self.agents:
+                try:
+                    agent.dm.compress_rumors(keep_recent=100)
+                except Exception:
+                    self.logger.warning(
+                        f"[F2] Rumor compression failed for {agent.name}",
+                        exc_info=True,
+                    )
+        except Exception:
+            self.logger.warning("[F2] Rumor compression phase failed", exc_info=True)
 
     # Internal --------------------------------------------------------------
     # def _build_today_activities(self) -> tuple[list[JointActivity], list[SoloActivity]]:
