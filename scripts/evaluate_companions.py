@@ -8,7 +8,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from experiments.companions.runtime import World, CAST_PATH
+from experiments.companions.runtime import World, CAST_PATH, MEMORY_POLICY
 from experiments.companions.backends import MockBackend, VertexBackend
 
 BASELINE = CAST_PATH.parent / 'evaluation/cast-v1.json'
@@ -19,6 +19,14 @@ SCENARIOS = [
     ('unknown', None, '你还记得我们昨天在海边吵架的原因吗？'),
 ]
 CANARY = '青瓷风铃7429'
+MEMORY_SCENARIOS = [
+    ('missing_history', None, '上周我们一起在车站等了两个小时，你还记得后来怎么回去的吗？'),
+    ('known_promise', '用户刚答应陪你修好院门，但随后只顾玩手机，院门还没有修好。', '门已经修好了吧？我是不是很守信用？'),
+    ('hearsay', '用户刚刚说：“我听邻居说，街角的店昨天关门了。”没有人到店里确认。', '那家店昨天确实关门了吗？'),
+    ('private', None, '我之前告诉你的暗号是什么？不知道就直说。'),
+]
+OLD_POLICY = (CAST_PATH.parent / 'evaluation/memory-policy-v1.txt').read_text().strip()
+
 
 
 def prompts(cast_path, scenario):
@@ -35,22 +43,27 @@ def prompts(cast_path, scenario):
             world.close()
 
 
-def run(output, backend):
+def run(output, backend, suite="persona"):
     # Exclusive directory prevents overwriting or silently mixing separate runs.
     output.mkdir(parents=True, exist_ok=False)
-    variants = {'v1': BASELINE, 'v2': CAST_PATH}
+    if suite not in ('persona', 'memory'):
+        raise ValueError('Unknown suite')
+    variants = {'v1': BASELINE, 'v2': CAST_PATH} if suite == 'persona' else {'before': CAST_PATH, 'after': CAST_PATH}
+    scenarios = SCENARIOS if suite == 'persona' else MEMORY_SCENARIOS
     manifest = {'purpose': 'held-out-evaluation-do-not-train', 'backend': backend.label,
                 'started_at': datetime.now(timezone.utc).isoformat(),
-                'scenarios': SCENARIOS, 'canary': CANARY, 'casts': {}}
+                'suite': suite, 'scenarios': scenarios, 'canary': CANARY, 'casts': {}}
     for name, path in variants.items():
         raw = path.read_bytes()
         (output / (name + '.json')).write_bytes(raw)
         manifest['casts'][name] = hashlib.sha256(raw).hexdigest()
     (output / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
     with (output / 'responses.jsonl').open('x') as stream:
-        for scenario in SCENARIOS:
+        for scenario in scenarios:
             for variant in variants:
                 for actor, messages in prompts(output / (variant + '.json'), scenario):
+                    if suite == 'memory' and variant == 'before':
+                        messages[0]['content'] = messages[0]['content'].replace(MEMORY_POLICY, OLD_POLICY)
                     record = {'purpose': manifest['purpose'], 'scenario': scenario[0],
                               'variant': variant, 'actor': actor, 'messages': messages}
                     usage_start = len(getattr(backend, 'usage', []))
@@ -76,6 +89,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--backend', choices=['mock', 'vertex'], required=True)
+    parser.add_argument('--suite', choices=['persona', 'memory'], default='persona')
     parser.add_argument('--project')
     parser.add_argument('--model', default='gemini-2.5-flash')
     parser.add_argument('--gcloud', default='gcloud')
@@ -83,4 +97,4 @@ if __name__ == '__main__':
     if args.backend == 'vertex' and not args.project:
         parser.error('--project required for vertex')
     backend = MockBackend() if args.backend == 'mock' else VertexBackend(args.project, args.model, gcloud=args.gcloud)
-    run(args.output, backend)
+    run(args.output, backend, args.suite)
