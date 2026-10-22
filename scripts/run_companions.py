@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from experiments.companions.runtime import World, encode
-from experiments.companions.backends import MockBackend, UpstreamBackend
+from experiments.companions.backends import MockBackend, UpstreamBackend, VertexBackend
 
 
 def main():
@@ -22,9 +22,12 @@ def main():
     event.add_argument('--text', required=True)
     for command in ('step', 'chat'):
         p = sub.add_parser(command)
-        p.add_argument('--backend', choices=('mock', 'upstream'), required=True)
+        p.add_argument('--backend', choices=('mock', 'upstream', 'vertex'), required=True)
         p.add_argument('--config', type=Path)
         p.add_argument('--model')
+        p.add_argument('--project')
+        p.add_argument('--location', default='global')
+        p.add_argument('--gcloud', default='gcloud')
         if command == 'step':
             p.add_argument('--steps', type=int, default=1)
         else:
@@ -44,10 +47,18 @@ def main():
         parser.error('--steps must be 1–20 (five model calls per step)')
     if getattr(args, 'backend', None) == 'upstream' and (not args.config or not args.model):
         parser.error('upstream requires --config and --model; it can incur API charges')
+    if getattr(args, 'backend', None) == 'vertex' and (not args.project or not args.model):
+        parser.error('vertex requires --project and --model; it can incur API charges')
     world = World(args.db)
+    backend = None
     try:
         if args.command in ('step', 'chat'):
-            backend = MockBackend() if args.backend == 'mock' else UpstreamBackend(args.config, args.model)
+            if args.backend == 'mock':
+                backend = MockBackend()
+            elif args.backend == 'vertex':
+                backend = VertexBackend(args.project, args.model, args.location, args.gcloud)
+            else:
+                backend = UpstreamBackend(args.config, args.model)
             if args.command == 'step':
                 for _ in range(args.steps):
                     print(encode({'tick': world.step(backend), 'backend': backend.label}))
@@ -78,6 +89,8 @@ def main():
             print(encode({'tick': world.tick, 'characters': [world.actor(a) for a in world.cards],
                           'note': 'Provisional character cards; not a trained model.'}))
     finally:
+        if isinstance(backend, VertexBackend):
+            print(encode({'usage': backend.usage}), file=sys.stderr)
         world.close()
 
 

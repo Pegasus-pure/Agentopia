@@ -30,7 +30,20 @@ python3 scripts/run_companions.py --db runs/live/world.sqlite3 step --steps 1 --
 python3 scripts/run_companions.py --db runs/live/world.sqlite3 chat --actor duodong --text '今天过得怎么样？' --backend upstream --config config.json --model YOUR_CONFIGURED_MODEL
 ```
 
-真实接口沿用上游的 `src.utils.get_response_json`，同样可对接本地模型服务。一次 `step` 请求五位角色，一次 `chat` 请求一位；上游可能调用配置中的 fallback。建议先单步验证，记录真实 token 与费用后再扩大。当前只完成离线验证，尚未验证特定服务商连接或模型质量。
+真实接口沿用上游的 `src.utils.get_response_json`，同样可对接本地模型服务。一次 `step` 请求五位角色，一次 `chat` 请求一位；上游可能调用配置中的 fallback。建议先单步验证，记录真实 token 与费用后再扩大。上游适配器尚未做服务商端到端验证；下述独立 Vertex 路径已通过真实请求。人格质量仍待评审。
+
+## 复用现有 Gemini / Vertex AI
+
+本机有 `gcloud auth login` 登录时，可以直接调用 Vertex Gemini，不需要启动模拟 VM，也不需要导出服务账号密钥。此路径使用 gcloud 登录身份；原服务器的 ADC 机器身份是另一种认证方式，不是把旧 fork 的补丁带回来。
+
+```bash
+python3 scripts/run_companions.py --db runs/gemini/world.sqlite3 chat --actor duodong --text '今天你想做什么？' --backend vertex --project YOUR_PROJECT_ID --model gemini-2.5-flash
+python3 scripts/run_companions.py --db runs/gemini/world.sqlite3 step --steps 1 --backend vertex --project YOUR_PROJECT_ID --model gemini-2.5-flash
+```
+
+可通过 `--gcloud /absolute/path/to/gcloud` 指定 CLI；默认 `--location global`。访问令牌仅在内存中用于请求头，不写入记录。每次请求输出实际 token 使用量到 stderr，不自动估算账单。响应必须完整且为 JSON；截断、拦截、失败均停止，不进行隐藏的批量重试。支持模型取决于项目的实际权限与服务可用性。
+
+[Google 生成接口文档](https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/inference)
 
 ## 行为与记忆语义
 
