@@ -116,6 +116,10 @@ class CompanionTests(unittest.TestCase):
     def test_export_only_reviewed_examples_and_original_context(self):
         self.world.chat('duodong', '你好', Fixture())
         self.assertEqual(list(self.world.export()), [])
+        report = self.world.audit_packet(1)
+        report['reviewer'] = 'test-reviewer'
+        report['fields']['reply'].update(verdict='nonfactual', reason='当前回应，无往事断言')
+        self.world.record_audit(1, report)
         self.world.review(1, 'accepted', '角色身份和记忆一致')
         self.world.observe('未来发生的事', ['duodong'])
         rows = list(self.world.export())

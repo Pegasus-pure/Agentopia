@@ -36,6 +36,9 @@ def main():
     replay = sub.add_parser('replay')
     replay.add_argument('--actor', required=True, help='Replay only this character’s visible events')
     sub.add_parser('traces')
+    audit = sub.add_parser('audit')
+    audit.add_argument('--id', type=int, required=True)
+    audit.add_argument('--report', type=Path, help='Completed audit JSON; omit to print template')
     review = sub.add_parser('review')
     review.add_argument('--id', type=int, required=True)
     review.add_argument('--verdict', choices=('accepted', 'rejected'), required=True)
@@ -74,6 +77,12 @@ def main():
         elif args.command == 'traces':
             for row in world.db.execute('SELECT * FROM traces ORDER BY id'):
                 print(encode(dict(row)))
+        elif args.command == 'audit':
+            if args.report:
+                passed = world.record_audit(args.id, json.loads(args.report.read_text()))
+                print(encode({'passed': passed, 'overall_review': 'pending'}))
+            else:
+                print(encode(world.audit_packet(args.id)))
         elif args.command == 'review':
             world.review(args.id, args.verdict, args.reason)
             print('Review recorded')

@@ -63,7 +63,7 @@ python3 scripts/run_companions.py --db runs/gemini/world.sqlite3 step --steps 1 
 
 ## 训练样本入口
 
-每次模型调用记录原始上下文，避免用后来发生的事倒灌训练输入。
+每次模型调用记录原始上下文，避免用后来发生的事倒灌训练输入。接受前必须完成 [事实审核](FACT_AUDIT.md)，逐项填写依据和判断；旧 accepted 标记不能绕过新审核。
 
 ```bash
 python3 scripts/run_companions.py --db runs/live/world.sqlite3 traces
@@ -71,7 +71,7 @@ python3 scripts/run_companions.py --db runs/live/world.sqlite3 review --id 1 --v
 python3 scripts/run_companions.py --db runs/live/world.sqlite3 export --output runs/live/reviewed.jsonl
 ```
 
-默认所有样本待审，只导出明确接受的真实模型样本；离线占位样本拒绝接受。导出文件使用排他创建，不覆盖旧数据。此入口是人工审核的 SFT 候选数据，不等同于上游 RFT 的优势计算，不代表已经完成蒸馏或强化学习。真实私聊也会进入 trace，导出前需确认其中内容适合训练。
+默认所有样本待审，只导出通过事实审核且明确接受的真实模型样本；离线占位样本拒绝接受。导出文件使用排他创建，不覆盖旧数据。此入口是人工审核的 SFT 候选数据，不等同于上游 RFT 的优势计算，不代表已经完成蒸馏或强化学习。真实私聊也会进入 trace，导出前需确认其中内容适合训练。
 
 下一步以整段场景划分训练/验证/测试集，避免同一事件的五人视角跨集合泄漏；平衡五位角色和行动/交流任务；保留拒绝样本，后续按需要构造偏好对。
 

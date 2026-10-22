@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from .audit import fingerprint, packet, validate
 from pathlib import Path
 
 MEMORY_POLICY = """角色方向暂定，不要把实验设定说成原作事实。
@@ -31,6 +32,10 @@ class World:
                 plan TEXT NOT NULL DEFAULT '', feeling TEXT NOT NULL DEFAULT '平静');
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, tick INTEGER NOT NULL,
                 kind TEXT NOT NULL, actor TEXT NOT NULL, audience TEXT NOT NULL, text TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS fact_audits(id INTEGER PRIMARY KEY,
+                trace_id INTEGER NOT NULL REFERENCES traces(id), fingerprint TEXT NOT NULL,
+                passed INTEGER NOT NULL, report TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
             CREATE TABLE IF NOT EXISTS traces(id INTEGER PRIMARY KEY, tick INTEGER NOT NULL,
                 actor TEXT NOT NULL, messages TEXT NOT NULL, response TEXT NOT NULL,
                 backend TEXT NOT NULL, review TEXT NOT NULL DEFAULT 'pending', reason TEXT NOT NULL DEFAULT '');
@@ -197,23 +202,52 @@ class World:
             self._trace(actor, messages, result, backend.label)
         return reply
 
+    def audit_packet(self, trace_id):
+        row = self.db.execute('SELECT * FROM traces WHERE id=?', (trace_id,)).fetchone()
+        if not row:
+            raise ValueError('Unknown trace')
+        return packet(row)
+
+    def record_audit(self, trace_id, report):
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            row = self.db.execute('SELECT * FROM traces WHERE id=?', (trace_id,)).fetchone()
+            if not row:
+                raise ValueError('Unknown trace')
+            passed, checked = validate(row, report)
+            self.db.execute('INSERT INTO fact_audits(trace_id,fingerprint,passed,report) VALUES(?,?,?,?)',
+                            (trace_id, fingerprint(row), int(passed), encode(checked)))
+            # Any new factual review requires fresh overall approval.
+            self.db.execute("UPDATE traces SET review='pending',reason='' WHERE id=?", (trace_id,))
+        return passed
+
+    def _passing_audit(self, row):
+        audit = self.db.execute('SELECT * FROM fact_audits WHERE trace_id=? ORDER BY id DESC LIMIT 1',
+                                (row['id'],)).fetchone()
+        return audit if audit and audit['passed'] and audit['fingerprint'] == fingerprint(row) else None
+
     def review(self, trace_id, verdict, reason):
         if verdict not in ('accepted', 'rejected') or not reason.strip():
             raise ValueError('Review requires verdict and reason')
         with self.db:
-            row = self.db.execute('SELECT backend FROM traces WHERE id=?', (trace_id,)).fetchone()
+            self.db.execute('BEGIN IMMEDIATE')
+            row = self.db.execute('SELECT * FROM traces WHERE id=?', (trace_id,)).fetchone()
             if not row:
                 raise ValueError('Unknown trace')
             if verdict == 'accepted' and row['backend'].startswith('mock'):
                 raise ValueError('Mock traces cannot be approved for training')
+            if verdict == 'accepted' and not self._passing_audit(row):
+                raise ValueError('A passing fact audit is required before approval')
             self.db.execute('UPDATE traces SET review=?,reason=? WHERE id=?', (verdict, reason, trace_id))
 
     def export(self):
         for row in self.db.execute("SELECT * FROM traces WHERE review='accepted' ORDER BY id"):
-            if row['backend'].startswith('mock'):
+            audit = self._passing_audit(row)
+            if row['backend'].startswith('mock') or not audit:
                 continue
             yield {'messages': json.loads(row['messages']) + [
                        {'role': 'assistant', 'content': row['response']}],
                    'metadata': {'trace_id': row['id'], 'actor': row['actor'],
                                 'tick': row['tick'], 'backend': row['backend'],
-                                'review_reason': row['reason']}}
+                                'review_reason': row['reason'], 'fact_audit_id': audit['id'],
+                                'fact_audit': json.loads(audit['report'])}}
