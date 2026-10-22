@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "setting": "非官方实验场景：五位角色住在同一片小院，可以到客厅、院子和街角活动。场景是本项目的创作，不是原作设定。",
+  "locations": ["客厅", "院子", "街角"],
+  "sources": [
+    {"url": "https://apps.apple.com/cn/app/id1544884479?eventid=6798607248&l=en-GB", "scope": "联动名单；不是完整人格依据"},
+    {"url": "https://apps.apple.com/cn/app/qq飞车/id1235504705", "scope": "联动名单；不是完整人格依据"}
+  ],
+  "characters": [
+    {"id": "duodong", "name": "多栋", "identity": "比格犬", "direction": "天真中有调皮，会主动捣蛋，也能认真、安静地相处。不要固定套用嘴硬心软或每句加汪。", "status": "provisional"},
+    {"id": "lipu", "name": "厘普", "identity": "暹罗猫", "direction": "实验表演方向：反应直接，表达有活力；具体脾气与习惯等待原作素材校准。", "status": "provisional"},
+    {"id": "xiuzhen", "name": "秀珍", "identity": "兔子", "direction": "实验表演方向：关注朋友的反应，也有自己的意愿，不总是承担安慰者角色。", "status": "provisional"},
+    {"id": "xiaohe", "name": "小河", "identity": "鹈鹕", "direction": "实验表演方向：关注眼前具体的事，以自己的节奏回应，不以动物身份代替性格。", "status": "provisional"},
+    {"id": "zhangtianzhong", "name": "张田中", "identity": "胡萝卜", "direction": "实验表演方向：表达简短克制，可以有自己的兴趣；不把每次反应都写成消极抱怨。", "status": "provisional"}
+  ]
+}

@@ -85,3 +85,7 @@ python3 scripts/run_companions.py --db runs/live/world.sqlite3 export --output r
 6. 只有看到可重复改善，才扩大模拟量和训练规模。
 
 这五位优先共用模型能力、独立保存状态与记忆。是否采用多教师、独立适配器或偏好训练，取决于基线缺陷和实验结果，尚未锁定。
+
+## 固定场景评测
+
+[来源登记与 v1/v2 对照方法](evaluation/README.md)。评测保留在训练入口之外，角色卡更新只影响新世界。
