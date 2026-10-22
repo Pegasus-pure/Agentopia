@@ -1,5 +1,7 @@
 # Agentopia
 
+> This fork starts from the original upstream. See the [five-character companion experiment](experiments/companions/README.md) and [provenance / research boundaries](docs/companions-provenance.md). The experiment is an untrained prototype; upstream simulation code is unchanged.
+
 **English** | [简体中文](docs/README.zh.md) | [日本語](docs/README.ja.md) | [한국어](docs/README.ko.md)
 
 **Agentopia** is a framework for long-term life simulation in multi-agent societies. Agentopia simulates human social life across years: In our experiments, 100 agents autonomously take part in social life over 10 simulated years. 

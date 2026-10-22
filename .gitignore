@@ -17,3 +17,13 @@ build/
 
 # OS
 .DS_Store
+
+# Local companion experiment state and provider credentials
+/config.json
+/config.local*.json
+/runs/
+/logs/
+/rft_data/
+.env
+*.sqlite3
+*.sqlite3-*
